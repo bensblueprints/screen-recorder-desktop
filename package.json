@@ -1,0 +1,45 @@
+{
+  "name": "screen-recorder",
+  "productName": "Screen Recorder",
+  "version": "1.0.0",
+  "description": "Local-first screen recorder. Record your screen + mic, save locally, export MP4/GIF. Pay once, own it forever — no subscription, no cloud, no watermark.",
+  "author": "Ben (bensblueprints)",
+  "license": "MIT",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node test/smoke.js",
+    "dist": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0"
+  },
+  "build": {
+    "appId": "co.bensblueprints.screenrecorder",
+    "productName": "Screen Recorder",
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/ffmpeg-static/**"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}

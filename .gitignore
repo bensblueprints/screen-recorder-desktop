@@ -4,3 +4,4 @@ test/tmp/
 *.log
 .DS_Store
 Thumbs.db
+release/

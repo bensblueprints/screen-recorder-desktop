@@ -7,8 +7,11 @@ contextBridge.exposeInMainWorld('api', {
   recordingStarted: () => ipcRenderer.send('recording:started'),
   recordingStopped: () => ipcRenderer.send('recording:stopped'),
   onStopRequested: (cb) => ipcRenderer.on('recording:stop-requested', cb),
-  saveRecording: (arrayBuffer) => ipcRenderer.invoke('recording:save', arrayBuffer),
+  saveRecording: (arrayBuffer, label) => ipcRenderer.invoke('recording:save', arrayBuffer, label),
   minimizeWindow: () => ipcRenderer.send('window:minimize'),
+
+  getSettings: () => ipcRenderer.invoke('settings:get'),
+  chooseOutputDir: () => ipcRenderer.invoke('settings:choose-output-dir'),
 
   // overlay
   overlayStop: () => ipcRenderer.send('overlay:stop-clicked'),

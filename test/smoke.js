@@ -37,7 +37,7 @@ function assertFile(file, minBytes, label) {
   console.log(`  ✓ ${label}: ${path.basename(file)} (${(size / 1024).toFixed(1)} KB)`);
 }
 
-console.log('Screen Recorder smoke test');
+console.log('BloomRecorder smoke test');
 console.log('ffmpeg binary:', ffmpeg);
 assert.ok(fs.existsSync(ffmpeg), 'ffmpeg-static binary missing');
 

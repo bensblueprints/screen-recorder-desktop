@@ -1,15 +1,17 @@
 {
-  "name": "screen-recorder",
-  "productName": "Screen Recorder",
+  "name": "bloomrecorder",
+  "productName": "BloomRecorder",
   "version": "1.0.0",
-  "description": "Local-first screen recorder. Record your screen + mic, save locally, export MP4/GIF. Pay once, own it forever — no subscription, no cloud, no watermark.",
+  "description": "BloomRecorder — local-first screen & camera recorder. Record your screen, webcam, or both (split or picture-in-picture) with mic + system audio, save locally, export MP4/GIF. Pay once, own it forever — no subscription, no cloud, no watermark.",
   "author": "Ben (bensblueprints)",
   "license": "MIT",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
     "test": "node test/smoke.js",
-    "dist": "electron-builder --win nsis"
+    "dist": "electron-builder --win nsis",
+    "dist:win": "electron-builder --win nsis",
+    "dist:mac": "electron-builder --mac dmg"
   },
   "devDependencies": {
     "electron": "^33.2.0",
@@ -19,8 +21,8 @@
     "ffmpeg-static": "^5.2.0"
   },
   "build": {
-    "appId": "co.bensblueprints.screenrecorder",
-    "productName": "Screen Recorder",
+    "appId": "com.bloomrecorder.app",
+    "productName": "BloomRecorder",
     "files": [
       "main.js",
       "preload.js",

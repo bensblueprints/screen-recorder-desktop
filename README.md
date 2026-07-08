@@ -1,10 +1,10 @@
-# 🎥 Screen Recorder
+# 🌸 BloomRecorder
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue.svg)]()
 [![Local First](https://img.shields.io/badge/100%25-local-red.svg)]()
 
-**The Loom replacement you buy once.** Record your screen and mic, save everything locally, export MP4 or GIF — no cloud, no monthly bill, no watermark, no upload limits. Your recordings live on *your* disk, not on someone else's server.
+**The Loom replacement you buy once.** Record your screen, your camera, or both — save everything locally, export MP4 or GIF — no cloud, no monthly bill, no watermark, no upload limits. Your recordings live on *your* disk, not on someone else's server.
 
 > **Pay once. Own it forever. No subscription.**
 
@@ -12,10 +12,14 @@
 
 ## ✨ Features
 
+- **Screen · Camera · Both** — record your screen, your webcam, or both at once
+- **Split or picture-in-picture** — with both selected, save two separate files (each with audio) or one combined video with the camera overlaid
 - **Source picker with live previews** — record any screen or individual window, thumbnails included
-- **Microphone audio** — one toggle, mixed cleanly with system audio into a single track
+- **Device selection** — choose exactly which camera and which microphone to record
+- **System + mic audio** — mixed cleanly, and carried into *every* output file
+- **Choose your output folder** — save recordings wherever you want; the choice sticks
 - **Floating recording pill** — tiny always-on-top timer with a stop button, so your main window stays out of the shot
-- **Local library** — every recording auto-saves to `Videos/Screen Recorder` with generated thumbnails, plays right in the app
+- **Local library** — every recording auto-saves to `Videos/BloomRecorder` with generated thumbnails, plays right in the app
 - **MP4 export** — H.264 + faststart, plays everywhere, with live progress
 - **Optimized GIF export** — proper two-pass palette generation (palettegen/paletteuse), not the muddy single-pass junk
 - **Trim** — set start/end seconds before exporting, no separate editor needed
@@ -24,8 +28,8 @@
 ## 🚀 Quick start
 
 ```bash
-git clone https://github.com/bensblueprints/screen-recorder
-cd screen-recorder
+git clone https://github.com/bensblueprints/screen-recorder-desktop
+cd screen-recorder-desktop
 npm i && npm start
 ```
 
@@ -49,7 +53,7 @@ Don't want to touch a terminal? Grab the packaged installer (one-time purchase, 
 
 ## 🥊 vs. Loom
 
-| | **Screen Recorder** | Loom Business |
+| | **BloomRecorder** | Loom Business |
 |---|---|---|
 | Price | **$29 once** | $15/mo, forever ($180/yr) |
 | Where videos live | **Your disk** | Their servers |
@@ -72,7 +76,7 @@ Loom is great for team clouds. If you just want to *record your screen and own t
 
 ## 📁 Where recordings go
 
-`%USERPROFILE%\Videos\Screen Recorder` (or your platform's Videos folder). The app never writes anywhere else, and "Open recordings folder" is one click away.
+`%USERPROFILE%\Videos\BloomRecorder` by default (or your platform's Videos folder) — and you can change it to any folder you like from the Record screen. "Open recordings folder" is one click away.
 
 ## License
 

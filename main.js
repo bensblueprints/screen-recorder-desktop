@@ -12,8 +12,25 @@ let selectedSourceId = null;
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
+function settingsFile() {
+  return path.join(app.getPath('userData'), 'settings.json');
+}
+
+function readSettings() {
+  try { return JSON.parse(fs.readFileSync(settingsFile(), 'utf8')); } catch { return {}; }
+}
+
+function writeSettings(s) {
+  try { fs.writeFileSync(settingsFile(), JSON.stringify(s, null, 2)); } catch {}
+}
+
+function defaultOutputDir() {
+  return path.join(app.getPath('videos'), 'BloomRecorder');
+}
+
 function libraryDir() {
-  const dir = path.join(app.getPath('videos'), 'Screen Recorder');
+  const s = readSettings();
+  const dir = s.outputDir || defaultOutputDir();
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -86,11 +103,12 @@ function createMainWindow() {
     minHeight: 560,
     backgroundColor: '#0b0d12',
     autoHideMenuBar: true,
-    title: 'Screen Recorder',
+    title: 'BloomRecorder',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      backgroundThrottling: false
     }
   });
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
@@ -158,12 +176,33 @@ ipcMain.on('overlay:stop-clicked', () => {
 });
 ipcMain.on('window:minimize', () => { if (mainWindow) mainWindow.minimize(); });
 
-ipcMain.handle('recording:save', async (_e, arrayBuffer) => {
+ipcMain.handle('recording:save', async (_e, arrayBuffer, label) => {
   const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
-  const file = path.join(libraryDir(), `recording-${stamp}.webm`);
+  const suffix = label ? '-' + String(label).replace(/[^a-z0-9_-]/gi, '') : '';
+  let file = path.join(libraryDir(), `recording-${stamp}${suffix}.webm`);
+  let n = 1;
+  while (fs.existsSync(file)) file = path.join(libraryDir(), `recording-${stamp}${suffix}-${n++}.webm`);
   fs.writeFileSync(file, Buffer.from(arrayBuffer));
   await ensureThumbnail(file);
   return file;
+});
+
+ipcMain.handle('settings:get', async () => {
+  const s = readSettings();
+  return { outputDir: s.outputDir || defaultOutputDir() };
+});
+
+ipcMain.handle('settings:choose-output-dir', async () => {
+  const res = await dialog.showOpenDialog(mainWindow, {
+    title: 'Choose where recordings are saved',
+    properties: ['openDirectory', 'createDirectory']
+  });
+  if (res.canceled || !res.filePaths.length) return null;
+  const s = readSettings();
+  s.outputDir = res.filePaths[0];
+  writeSettings(s);
+  fs.mkdirSync(s.outputDir, { recursive: true });
+  return s.outputDir;
 });
 
 ipcMain.handle('library:list', async () => {
@@ -290,6 +329,26 @@ app.whenReady().then(async () => {
     mainWindow.webContents.once('did-finish-load', () => {
       console.log('[smoke-boot] renderer loaded OK, exiting.');
       setTimeout(() => app.exit(0), 500);
+    });
+    return;
+  }
+
+  // Screenshot mode: render the window, capture it to docs/screenshot.png, exit.
+  if (process.env.SHOT) {
+    createMainWindow();
+    mainWindow.webContents.once('did-finish-load', () => {
+      setTimeout(async () => {
+        try {
+          const img = await mainWindow.webContents.capturePage();
+          const out = path.join(__dirname, 'docs', 'screenshot.png');
+          fs.mkdirSync(path.dirname(out), { recursive: true });
+          fs.writeFileSync(out, img.toPNG());
+          console.log('[shot] wrote ' + out);
+        } catch (e) {
+          console.error('[shot] failed', e);
+        }
+        app.exit(0);
+      }, 2000);
     });
     return;
   }

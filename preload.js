@@ -1,6 +1,9 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('api', {
+  activateLicense: (key) => ipcRenderer.invoke('license:activate', key),
+  openExternal: (url) => ipcRenderer.send('shell:open-external', url),
+
   listSources: () => ipcRenderer.invoke('sources:list'),
   selectSource: (id) => ipcRenderer.send('capture:select-source', id),
 

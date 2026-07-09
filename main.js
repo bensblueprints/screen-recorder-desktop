@@ -4,9 +4,11 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 
 const ffmpegPath = require('ffmpeg-static').replace('app.asar', 'app.asar.unpacked');
+const license = require('./licensing');
 
 let mainWindow = null;
 let overlayWindow = null;
+let licenseWindow = null;
 let selectedSourceId = null;
 
 // ---------------------------------------------------------------------------
@@ -143,6 +145,24 @@ function destroyOverlay() {
   if (overlayWindow) { overlayWindow.destroy(); overlayWindow = null; }
 }
 
+function createLicenseWindow() {
+  licenseWindow = new BrowserWindow({
+    width: 440,
+    height: 360,
+    resizable: false,
+    autoHideMenuBar: true,
+    backgroundColor: '#0b0d12',
+    title: 'Activate BloomRecorder',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  licenseWindow.loadFile(path.join(__dirname, 'renderer', 'license.html'));
+  licenseWindow.on('closed', () => { licenseWindow = null; });
+}
+
 // ---------------------------------------------------------------------------
 // IPC
 // ---------------------------------------------------------------------------
@@ -175,6 +195,19 @@ ipcMain.on('overlay:stop-clicked', () => {
   }
 });
 ipcMain.on('window:minimize', () => { if (mainWindow) mainWindow.minimize(); });
+
+ipcMain.handle('license:activate', async (_e, key) => {
+  const result = await license.activate(key);
+  if (result.valid && licenseWindow) {
+    licenseWindow.close();
+    createMainWindow();
+  }
+  return result;
+});
+
+ipcMain.on('shell:open-external', (_e, url) => {
+  if (/^https:\/\//.test(url)) shell.openExternal(url);
+});
 
 ipcMain.handle('recording:save', async (_e, arrayBuffer, label) => {
   const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
@@ -361,10 +394,15 @@ app.whenReady().then(async () => {
     return;
   }
 
-  createMainWindow();
+  const openInitialWindow = () => {
+    if (license.requiresActivation()) createLicenseWindow();
+    else createMainWindow();
+  };
+
+  openInitialWindow();
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
+    if (BrowserWindow.getAllWindows().length === 0) openInitialWindow();
   });
 });
 

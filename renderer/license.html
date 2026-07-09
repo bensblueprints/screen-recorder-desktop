@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'" />
+  <title>Activate BloomRecorder</title>
+  <style>
+    :root {
+      --bg: #0b0d12;
+      --bg-2: #11141c;
+      --bg-3: #171b26;
+      --border: #232838;
+      --text: #e8ebf4;
+      --muted: #8b93a7;
+      --accent-2: #6366f1;
+      --danger: #ef4444;
+      --radius: 12px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .card {
+      width: 380px;
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px;
+    }
+    .brand-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent-2), #ef4444);
+      display: inline-block; margin-right: 8px;
+    }
+    h1 { font-size: 16px; margin: 0 0 4px; display: flex; align-items: center; }
+    p.muted { color: var(--muted); font-size: 12.5px; margin: 0 0 20px; }
+    label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 6px; }
+    input {
+      width: 100%; font-size: 13px; color: var(--text);
+      background: var(--bg-3); border: 1px solid var(--border); border-radius: 8px;
+      padding: 10px 12px; outline: none;
+    }
+    input:focus { border-color: var(--accent-2); }
+    .error {
+      color: var(--danger); font-size: 12px; margin-top: 10px; min-height: 16px;
+    }
+    button.primary {
+      width: 100%; margin-top: 18px; padding: 10px 0;
+      background: var(--accent-2); border: none; border-radius: 8px;
+      color: #fff; font-size: 13px; font-weight: 600; cursor: pointer;
+    }
+    button.primary:disabled { opacity: 0.6; cursor: default; }
+    button.primary:not(:disabled):hover { filter: brightness(1.08); }
+    .buy {
+      display: block; text-align: center; margin-top: 14px;
+      font-size: 12px; color: var(--muted); text-decoration: none;
+    }
+    .buy:hover { color: var(--text); }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1><span class="brand-dot"></span>Activate BloomRecorder</h1>
+    <p class="muted">Enter the license key from your Whop purchase confirmation.</p>
+    <label for="key">License key</label>
+    <input id="key" type="text" autocomplete="off" spellcheck="false" placeholder="xxxxxxxx-xxxx-xxxx" />
+    <div id="error" class="error"></div>
+    <button id="activate" class="primary">Activate</button>
+    <a class="buy" href="#" id="buy-link">Don't have a license? Get one at bloomrecorder.com</a>
+  </div>
+  <script src="license.js"></script>
+</body>
+</html>

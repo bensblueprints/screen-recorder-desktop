@@ -281,17 +281,11 @@ const CAPTION_STYLES = {
 };
 const DEFAULT_CAPTION_STYLE = 'classic';
 
-// ASS alignment is numpad-style: 1/2/3 = bottom L/C/R, 4/5/6 = middle, 7/8/9 = top.
-// Captions are always horizontally centered; position picks the vertical anchor.
-const CAPTION_POSITIONS = {
-  top: { alignment: 8, marginV: 40 },
-  middle: { alignment: 5, marginV: 0 },
-  bottom: { alignment: 2, marginV: 60 }
-};
-const DEFAULT_CAPTION_POSITION = 'bottom';
 const MIN_CAPTION_SIZE = 14;
 const MAX_CAPTION_SIZE = 56;
 const DEFAULT_CAPTION_SIZE = 22;
+const DEFAULT_CAPTION_X_PCT = 0.5;
+const DEFAULT_CAPTION_Y_PCT = 0.88;
 
 function assTimestamp(t) {
   const cs = Math.max(0, Math.round(t * 100));
@@ -307,20 +301,28 @@ function escapeAssText(text) {
 }
 
 // videoW/videoH set PlayResX/PlayResY to the real video's resolution so
-// FontSize/MarginV land in actual video pixels instead of ffmpeg's default
+// FontSize/position land in actual video pixels instead of ffmpeg's default
 // 384x288 reference frame (the other half of why captions showed up at the
 // wrong size/position — that default applied regardless of force_style).
-function buildAssDocument(cues, styleKey, positionKey, fontSize, videoW, videoH) {
+//
+// Position is a literal drag point (xPct/yPct, fractions of the frame) from
+// the UI, not a preset. Alignment is fixed to 5 (middle-center anchor) and
+// each event carries a \pos(x,y) override so the CENTER of the caption text
+// lands exactly where the user dragged it.
+function buildAssDocument(cues, styleKey, xPct, yPct, fontSize, videoW, videoH) {
   const look = CAPTION_STYLES[styleKey] || CAPTION_STYLES[DEFAULT_CAPTION_STYLE];
-  const pos = CAPTION_POSITIONS[positionKey] || CAPTION_POSITIONS[DEFAULT_CAPTION_POSITION];
   const size = Math.min(MAX_CAPTION_SIZE, Math.max(MIN_CAPTION_SIZE, Math.round(Number(fontSize)) || DEFAULT_CAPTION_SIZE));
   const w = videoW || 1920;
   const h = videoH || 1080;
+  const xFrac = Number.isFinite(Number(xPct)) ? Math.min(1, Math.max(0, Number(xPct))) : DEFAULT_CAPTION_X_PCT;
+  const yFrac = Number.isFinite(Number(yPct)) ? Math.min(1, Math.max(0, Number(yPct))) : DEFAULT_CAPTION_Y_PCT;
+  const x = Math.round(xFrac * w);
+  const y = Math.round(yFrac * h);
 
-  const header = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${w}\nPlayResY: ${h}\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,${look.fontName},${size},${look.primary},&H000000FF,${look.outline},${look.back},${look.bold},0,0,0,100,100,0,0,${look.borderStyle},${look.outlineWidth},${look.shadow},${pos.alignment},10,10,${pos.marginV},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`;
+  const header = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${w}\nPlayResY: ${h}\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,${look.fontName},${size},${look.primary},&H000000FF,${look.outline},${look.back},${look.bold},0,0,0,100,100,0,0,${look.borderStyle},${look.outlineWidth},${look.shadow},5,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`;
 
   const events = cues
-    .map((c) => `Dialogue: 0,${assTimestamp(c.start)},${assTimestamp(c.end)},Default,,0,0,0,,${escapeAssText(c.text)}`)
+    .map((c) => `Dialogue: 0,${assTimestamp(c.start)},${assTimestamp(c.end)},Default,,0,0,0,,{\\pos(${x},${y})}${escapeAssText(c.text)}`)
     .join('\n');
 
   return header + events + '\n';
@@ -669,7 +671,7 @@ ipcMain.handle('captions:transcribe', async (e, filePath) => {
 });
 
 ipcMain.handle('captions:burn', async (e, opts) => {
-  const { input, replace, style, mode, position, fontSize } = opts;
+  const { input, replace, style, mode, xPct, yPct, fontSize } = opts;
   const dir = libraryDir();
   const base = baseName(input);
 
@@ -678,7 +680,7 @@ ipcMain.handle('captions:burn', async (e, opts) => {
   if (!cues.length) throw new Error('No speech detected to caption');
 
   const [inDur, videoRes] = await Promise.all([ffprobeDuration(input), ffprobeResolution(input)]);
-  const assDoc = buildAssDocument(cues, style, position, fontSize, videoRes && videoRes.width, videoRes && videoRes.height);
+  const assDoc = buildAssDocument(cues, style, xPct, yPct, fontSize, videoRes && videoRes.width, videoRes && videoRes.height);
 
   const work = tmpWorkDir();
   const assName = `captions-${Date.now()}.ass`;
@@ -851,34 +853,63 @@ ipcMain.handle('library:find-pair', async (_e, filePath) => {
 });
 
 ipcMain.handle('shorts:build', async (e, opts) => {
-  const { screenPath, cameraPath, cameraOnTop } = opts;
-  const base = path.basename(screenPath).replace(/-screen\.webm$/, '');
-  let output = path.join(libraryDir(), `${base}-short.mp4`);
+  const { combine, input, screenPath, cameraPath, cameraOnTop } = opts;
+  const dir = libraryDir();
+
+  if (combine && screenPath && cameraPath) {
+    const base = path.basename(screenPath).replace(/-screen\.webm$/, '');
+    let output = path.join(dir, `${base}-short.mp4`);
+    let n = 1;
+    while (fs.existsSync(output)) output = path.join(dir, `${base}-short-${n++}.mp4`);
+
+    const topPath = cameraOnTop ? cameraPath : screenPath;
+    const bottomPath = cameraOnTop ? screenPath : cameraPath;
+    const audioIdx = cameraOnTop ? 1 : 0; // prefer the screen track's audio (full mixed mic+system)
+
+    const screenDur = await ffprobeDuration(screenPath);
+    const camDur = await ffprobeDuration(cameraPath);
+    const outDur = Math.min(screenDur || Infinity, camDur || Infinity);
+    const sendProgress = (secs) => {
+      if (outDur && Number.isFinite(outDur)) e.sender.send('shorts:progress', { output, percent: Math.min(99, Math.round((secs / outDur) * 100)) });
+    };
+
+    await runFfmpeg([
+      '-i', topPath,
+      '-i', bottomPath,
+      '-filter_complex',
+      '[0:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[top];' +
+      '[1:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[bottom];' +
+      '[top][bottom]vstack=inputs=2[v]',
+      '-map', '[v]', '-map', `${audioIdx}:a?`,
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-b:a', '160k',
+      '-shortest',
+      output
+    ], sendProgress);
+
+    e.sender.send('shorts:progress', { output, percent: 100 });
+    await ensureThumbnail(output);
+    return { output, size: fs.statSync(output).size };
+  }
+
+  // Single video, no pair (or combine turned off) — center-crop the whole
+  // clip to 9:16, same technique as Make Reels' per-window crop.
+  const base = baseName(input);
+  let output = path.join(dir, `${base}-short.mp4`);
   let n = 1;
-  while (fs.existsSync(output)) output = path.join(libraryDir(), `${base}-short-${n++}.mp4`);
+  while (fs.existsSync(output)) output = path.join(dir, `${base}-short-${n++}.mp4`);
 
-  const topPath = cameraOnTop ? cameraPath : screenPath;
-  const bottomPath = cameraOnTop ? screenPath : cameraPath;
-  const audioIdx = cameraOnTop ? 1 : 0; // prefer the screen track's audio (full mixed mic+system)
-
-  const screenDur = await ffprobeDuration(screenPath);
-  const camDur = await ffprobeDuration(cameraPath);
-  const outDur = Math.min(screenDur || Infinity, camDur || Infinity);
+  const inDur = await ffprobeDuration(input);
   const sendProgress = (secs) => {
-    if (outDur && Number.isFinite(outDur)) e.sender.send('shorts:progress', { output, percent: Math.min(99, Math.round((secs / outDur) * 100)) });
+    if (inDur) e.sender.send('shorts:progress', { output, percent: Math.min(99, Math.round((secs / inDur) * 100)) });
   };
 
   await runFfmpeg([
-    '-i', topPath,
-    '-i', bottomPath,
-    '-filter_complex',
-    '[0:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[top];' +
-    '[1:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[bottom];' +
-    '[top][bottom]vstack=inputs=2[v]',
-    '-map', '[v]', '-map', `${audioIdx}:a?`,
+    '-i', input,
+    '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-b:a', '160k',
-    '-shortest',
+    '-movflags', '+faststart',
     output
   ], sendProgress);
 

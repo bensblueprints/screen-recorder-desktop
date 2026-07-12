@@ -286,7 +286,12 @@
       </div>
 
       <div id="short-block" class="short-block hidden">
-        <label class="mic-toggle" for="short-cam-top">
+        <label class="mic-toggle" for="short-combine">
+          <input type="checkbox" id="short-combine" />
+          <span class="switch"></span>
+          Combine screen + camera <span class="hint-inline" id="short-combine-hint"></span>
+        </label>
+        <label class="mic-toggle" for="short-cam-top" id="short-cam-top-row">
           <input type="checkbox" id="short-cam-top" />
           <span class="switch"></span>
           Camera on top <span class="hint-inline">off = screen on top, camera on bottom</span>
@@ -317,11 +322,12 @@
         </div>
         <div class="device-row">
           <label class="device-label">Position</label>
-          <select id="captions-position" class="device-select">
-            <option value="top">Top</option>
-            <option value="middle">Middle</option>
-            <option value="bottom" selected>Bottom</option>
-          </select>
+          <div class="lib-filter-chips">
+            <button type="button" class="chip" data-caption-preset="top">Top</button>
+            <button type="button" class="chip" data-caption-preset="middle">Middle</button>
+            <button type="button" class="chip active" data-caption-preset="bottom">Bottom</button>
+          </div>
+          <span class="hint-inline">or drag the caption on the video above</span>
         </div>
         <div class="device-row">
           <label class="device-label">Size</label>

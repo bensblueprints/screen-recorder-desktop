@@ -1005,6 +1005,8 @@ async function openModal(item) {
   $('#reels-block').classList.toggle('hidden', !canTranscribe);
   $('#make-reels').disabled = !canTranscribe || makingReels;
   $('#captions-preview').classList.toggle('hidden', !canTranscribe);
+  captionsPos = { ...CAPTION_PRESETS.bottom };
+  document.querySelectorAll('.chip[data-caption-preset]').forEach((c) => c.classList.toggle('active', c.dataset.captionPreset === 'bottom'));
   if (canTranscribe) updateCaptionsPreview();
 
   // WebM from MediaRecorder often reports Infinity duration; ask ffmpeg.
@@ -1016,14 +1018,17 @@ async function openModal(item) {
   }
 
   if (item.ext === 'webm') {
-    try {
-      currentPair = await window.api.findPair(item.path);
-      if (currentPair) {
-        $('#short-block').classList.remove('hidden');
-        $('#build-short').disabled = buildingShort;
-      }
-    } catch { /* no pair, ignore */ }
+    try { currentPair = await window.api.findPair(item.path); } catch { currentPair = null; }
   }
+  const hasPair = !!currentPair;
+  $('#short-block').classList.toggle('hidden', !canExport);
+  $('#build-short').disabled = !canExport || buildingShort;
+  $('#short-combine').checked = hasPair;
+  $('#short-combine').disabled = !hasPair;
+  $('#short-combine-hint').textContent = hasPair
+    ? '(screen + camera pair found)'
+    : '(no paired recording — will crop just this video to 9:16)';
+  $('#short-cam-top-row').classList.toggle('hidden', !(hasPair && $('#short-combine').checked));
 }
 
 function closeModal() {
@@ -1121,8 +1126,13 @@ window.api.onExportProgress(({ percent }) => {
 $('#export-mp4').addEventListener('click', () => runExport('mp4'));
 $('#export-gif').addEventListener('click', () => runExport('gif'));
 
+$('#short-combine').addEventListener('change', () => {
+  $('#short-cam-top-row').classList.toggle('hidden', !($('#short-combine').checked && currentPair));
+});
+
 $('#build-short').addEventListener('click', async () => {
-  if (!currentPair || buildingShort) return;
+  if (!currentItem || buildingShort) return;
+  const combine = $('#short-combine').checked && !!currentPair;
   buildingShort = true;
   const progWrap = $('#short-progress');
   const fill = $('#short-progress-fill');
@@ -1133,10 +1143,14 @@ $('#build-short').addEventListener('click', async () => {
   $('#build-short').disabled = true;
 
   try {
-    const res = await window.api.buildShort({
+    const res = await window.api.buildShort(combine ? {
+      combine: true,
       screenPath: currentPair.screenPath,
       cameraPath: currentPair.cameraPath,
       cameraOnTop: $('#short-cam-top').checked
+    } : {
+      combine: false,
+      input: currentItem.path
     });
     fill.style.width = '100%';
     label.textContent = 'Done → ' + res.output.split(/[\\/]/).pop() + ' (' + fmtSize(res.size) + ')';
@@ -1175,6 +1189,10 @@ function describeProgress(p) {
 // Rough CSS approximation of the ffmpeg/libass output — not pixel-perfect,
 // but enough to see roughly where captions will land before burning them in.
 const CAPTION_PREVIEW_SAMPLE = { line: 'This is a sample caption line', word: 'WORD' };
+const CAPTION_PRESETS = { top: { xPct: 0.5, yPct: 0.12 }, middle: { xPct: 0.5, yPct: 0.5 }, bottom: { xPct: 0.5, yPct: 0.88 } };
+
+let captionsPos = { ...CAPTION_PRESETS.bottom }; // fractions of the player, drag-updated
+let captionsDrag = null;
 
 function updateCaptionsPreview() {
   const preview = $('#captions-preview');
@@ -1182,13 +1200,15 @@ function updateCaptionsPreview() {
 
   const style = $('#captions-style').value;
   const mode = $('#captions-mode').value;
-  const position = $('#captions-position').value;
   const size = parseInt($('#captions-size').value, 10);
   $('#captions-size-label').textContent = size + 'px';
 
-  preview.className = 'captions-preview style-' + style + ' pos-' + position;
+  preview.className = 'captions-preview style-' + style + (captionsDrag ? ' dragging' : '');
   const text = CAPTION_PREVIEW_SAMPLE[mode] || CAPTION_PREVIEW_SAMPLE.line;
   preview.innerHTML = style === 'black-box' ? `<span>${text}</span>` : text;
+
+  preview.style.left = (captionsPos.xPct * 100) + '%';
+  preview.style.top = (captionsPos.yPct * 100) + '%';
 
   const player = $('#player');
   const videoH = player.videoHeight || 720;
@@ -1197,10 +1217,40 @@ function updateCaptionsPreview() {
   preview.style.fontSize = Math.max(10, Math.round(scaled)) + 'px';
 }
 
-['captions-style', 'captions-mode', 'captions-position', 'captions-size'].forEach((id) => {
+['captions-style', 'captions-mode', 'captions-size'].forEach((id) => {
   $('#' + id).addEventListener('input', updateCaptionsPreview);
 });
 $('#player').addEventListener('loadedmetadata', updateCaptionsPreview);
+
+document.querySelectorAll('.chip[data-caption-preset]').forEach((chip) => {
+  chip.addEventListener('click', () => {
+    document.querySelectorAll('.chip[data-caption-preset]').forEach((c) => c.classList.remove('active'));
+    chip.classList.add('active');
+    captionsPos = { ...CAPTION_PRESETS[chip.dataset.captionPreset] };
+    updateCaptionsPreview();
+  });
+});
+
+$('#captions-preview').addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  document.querySelectorAll('.chip[data-caption-preset]').forEach((c) => c.classList.remove('active'));
+  const wrap = $('#player-wrap');
+  captionsDrag = { startX: e.clientX, startY: e.clientY, startPos: { ...captionsPos }, w: wrap.clientWidth, h: wrap.clientHeight };
+  updateCaptionsPreview();
+});
+window.addEventListener('pointermove', (e) => {
+  if (!captionsDrag) return;
+  const dx = (e.clientX - captionsDrag.startX) / captionsDrag.w;
+  const dy = (e.clientY - captionsDrag.startY) / captionsDrag.h;
+  captionsPos.xPct = Math.min(0.97, Math.max(0.03, captionsDrag.startPos.xPct + dx));
+  captionsPos.yPct = Math.min(0.97, Math.max(0.03, captionsDrag.startPos.yPct + dy));
+  updateCaptionsPreview();
+});
+window.addEventListener('pointerup', () => {
+  if (!captionsDrag) return;
+  captionsDrag = null;
+  updateCaptionsPreview();
+});
 
 $('#add-captions').addEventListener('click', async () => {
   if (!currentItem || capturingCaptions) return;
@@ -1219,7 +1269,8 @@ $('#add-captions').addEventListener('click', async () => {
       replace: $('#captions-replace').checked,
       style: $('#captions-style').value,
       mode: $('#captions-mode').value,
-      position: $('#captions-position').value,
+      xPct: captionsPos.xPct,
+      yPct: captionsPos.yPct,
       fontSize: parseInt($('#captions-size').value, 10)
     });
     fill.style.width = '100%';

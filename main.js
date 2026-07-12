@@ -103,9 +103,9 @@ function writeTranscript(videoPath, data) {
 // ---------------------------------------------------------------------------
 // ffmpeg helpers
 // ---------------------------------------------------------------------------
-function runFfmpeg(args, onProgress) {
+function runFfmpeg(args, onProgress, cwd) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(ffmpegPath, ['-y', '-hide_banner', ...args], { windowsHide: true });
+    const proc = spawn(ffmpegPath, ['-y', '-hide_banner', ...args], { windowsHide: true, ...(cwd ? { cwd } : {}) });
     let stderr = '';
     proc.stderr.on('data', (d) => {
       stderr += d.toString();
@@ -134,6 +134,19 @@ function ffprobeDuration(file) {
       if (m && m[1] !== 'N/A') {
         resolve(Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]));
       } else resolve(null);
+    });
+    proc.on('error', () => resolve(null));
+  });
+}
+
+function ffprobeResolution(file) {
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpegPath, ['-hide_banner', '-i', file, '-f', 'null', '-t', '0.1', '-'], { windowsHide: true });
+    let out = '';
+    proc.stderr.on('data', (d) => { out += d.toString(); });
+    proc.on('close', () => {
+      const m = /Video:.*?(\d{2,5})x(\d{2,5})/.exec(out);
+      resolve(m ? { width: Number(m[1]), height: Number(m[2]) } : null);
     });
     proc.on('error', () => resolve(null));
   });
@@ -253,15 +266,18 @@ function transcriptToCues(transcript, mode) {
   return cues;
 }
 
-// Caption style templates — the "look" half of a libass force_style string
-// for ffmpeg's subtitles filter. Colours are &HAABBGGRR (alpha, blue, green,
-// red). Size and position are separate user controls, composed in at burn
-// time by buildForceStyle() rather than baked into each template.
+// Caption style templates. Colours are ASS &HAABBGGRR (alpha, blue, green,
+// red) hex. NOTE: ffmpeg's `subtitles` filter force_style option is broken
+// in the bundled ffmpeg-static build (verified: identical output with and
+// without it, even against a hand-authored .ass file with a distinguishable
+// baseline) — so instead of relying on force_style, buildAssDocument() bakes
+// the chosen look/size/position directly into a real .ass Style line and we
+// burn that in with no force_style at all.
 const CAPTION_STYLES = {
-  classic: 'FontName=Arial,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Bold=1',
-  'bold-yellow': 'FontName=Arial Black,PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Bold=1',
-  'black-box': 'FontName=Arial,PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=6,Shadow=0,Bold=1',
-  'yellow-outline': 'FontName=Arial Black,PrimaryColour=&H00FFFFFF,OutlineColour=&H0000FFFF,BorderStyle=1,Outline=4,Shadow=0,Bold=1'
+  classic: { fontName: 'Arial', primary: '&H00FFFFFF', outline: '&H00000000', back: '&H00000000', bold: 1, borderStyle: 1, outlineWidth: 2, shadow: 0 },
+  'bold-yellow': { fontName: 'Arial Black', primary: '&H0000FFFF', outline: '&H00000000', back: '&H00000000', bold: 1, borderStyle: 1, outlineWidth: 3, shadow: 0 },
+  'black-box': { fontName: 'Arial', primary: '&H0000FFFF', outline: '&H00000000', back: '&H00000000', bold: 1, borderStyle: 3, outlineWidth: 6, shadow: 0 },
+  'yellow-outline': { fontName: 'Arial Black', primary: '&H00FFFFFF', outline: '&H0000FFFF', back: '&H00000000', bold: 1, borderStyle: 1, outlineWidth: 4, shadow: 0 }
 };
 const DEFAULT_CAPTION_STYLE = 'classic';
 
@@ -277,24 +293,37 @@ const MIN_CAPTION_SIZE = 14;
 const MAX_CAPTION_SIZE = 56;
 const DEFAULT_CAPTION_SIZE = 22;
 
-function buildForceStyle(style, position, fontSize) {
-  const look = CAPTION_STYLES[style] || CAPTION_STYLES[DEFAULT_CAPTION_STYLE];
-  const pos = CAPTION_POSITIONS[position] || CAPTION_POSITIONS[DEFAULT_CAPTION_POSITION];
+function assTimestamp(t) {
+  const cs = Math.max(0, Math.round(t * 100));
+  const h = Math.floor(cs / 360000);
+  const m = Math.floor((cs % 360000) / 6000);
+  const s = Math.floor((cs % 6000) / 100);
+  const c = cs % 100;
+  return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(c).padStart(2, '0')}`;
+}
+
+function escapeAssText(text) {
+  return String(text).replace(/\\/g, '\\\\').replace(/\{/g, '\\{').replace(/\}/g, '\\}').replace(/\r?\n/g, '\\N');
+}
+
+// videoW/videoH set PlayResX/PlayResY to the real video's resolution so
+// FontSize/MarginV land in actual video pixels instead of ffmpeg's default
+// 384x288 reference frame (the other half of why captions showed up at the
+// wrong size/position — that default applied regardless of force_style).
+function buildAssDocument(cues, styleKey, positionKey, fontSize, videoW, videoH) {
+  const look = CAPTION_STYLES[styleKey] || CAPTION_STYLES[DEFAULT_CAPTION_STYLE];
+  const pos = CAPTION_POSITIONS[positionKey] || CAPTION_POSITIONS[DEFAULT_CAPTION_POSITION];
   const size = Math.min(MAX_CAPTION_SIZE, Math.max(MIN_CAPTION_SIZE, Math.round(Number(fontSize)) || DEFAULT_CAPTION_SIZE));
-  return `${look},FontSize=${size},Alignment=${pos.alignment},MarginV=${pos.marginV}`;
-}
+  const w = videoW || 1920;
+  const h = videoH || 1080;
 
-function srtTimestamp(t) {
-  const ms = Math.max(0, Math.round(t * 1000));
-  const h = Math.floor(ms / 3600000);
-  const m = Math.floor((ms % 3600000) / 60000);
-  const s = Math.floor((ms % 60000) / 1000);
-  const msRem = ms % 1000;
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(msRem).padStart(3, '0')}`;
-}
+  const header = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${w}\nPlayResY: ${h}\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,${look.fontName},${size},${look.primary},&H000000FF,${look.outline},${look.back},${look.bold},0,0,0,100,100,0,0,${look.borderStyle},${look.outlineWidth},${look.shadow},${pos.alignment},10,10,${pos.marginV},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`;
 
-function cuesToSrt(cues) {
-  return cues.map((c, i) => `${i + 1}\n${srtTimestamp(c.start)} --> ${srtTimestamp(c.end)}\n${c.text}\n`).join('\n');
+  const events = cues
+    .map((c) => `Dialogue: 0,${assTimestamp(c.start)},${assTimestamp(c.end)},Default,,0,0,0,,${escapeAssText(c.text)}`)
+    .join('\n');
+
+  return header + events + '\n';
 }
 
 // ---------------------------------------------------------------------------
@@ -643,34 +672,39 @@ ipcMain.handle('captions:burn', async (e, opts) => {
   const { input, replace, style, mode, position, fontSize } = opts;
   const dir = libraryDir();
   const base = baseName(input);
-  const styleStr = buildForceStyle(style, position, fontSize);
 
   const transcript = await transcribeVideo(input, (p) => e.sender.send('captions:progress', p));
   const cues = transcriptToCues(transcript, mode);
   if (!cues.length) throw new Error('No speech detected to caption');
 
+  const [inDur, videoRes] = await Promise.all([ffprobeDuration(input), ffprobeResolution(input)]);
+  const assDoc = buildAssDocument(cues, style, position, fontSize, videoRes && videoRes.width, videoRes && videoRes.height);
+
   const work = tmpWorkDir();
-  const srtPath = path.join(work, `captions-${Date.now()}.srt`);
-  fs.writeFileSync(srtPath, cuesToSrt(cues), 'utf8');
-  const escapedSrt = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+  const assName = `captions-${Date.now()}.ass`;
+  fs.writeFileSync(path.join(work, assName), assDoc, 'utf8');
 
   const tempOut = path.join(work, `captioned-${Date.now()}.mp4`);
-  const inDur = await ffprobeDuration(input);
   const sendProgress = (secs) => {
     if (inDur) e.sender.send('captions:progress', { phase: 'burning', percent: Math.min(99, Math.round((secs / inDur) * 100)) });
   };
 
   try {
+    // ffmpeg's subtitles filter mis-parses a drive-letter colon inside its
+    // own option string regardless of quoting/escaping — running with cwd
+    // set to the .ass file's own directory and referencing it by bare name
+    // sidesteps that entirely (input/output paths below are unaffected
+    // since they're plain argv, not embedded in a -vf filter string).
     await runFfmpeg([
       '-i', input,
-      '-vf', `subtitles='${escapedSrt}':force_style='${styleStr}'`,
+      '-vf', `subtitles=${assName}`,
       '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
       '-c:a', 'aac', '-b:a', '160k',
       '-movflags', '+faststart',
       tempOut
-    ], sendProgress);
+    ], sendProgress, work);
   } finally {
-    fs.rmSync(srtPath, { force: true });
+    fs.rmSync(path.join(work, assName), { force: true });
   }
 
   let output;

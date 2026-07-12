@@ -8,6 +8,7 @@ const ffmpegPath = require('ffmpeg-static').replace('app.asar', 'app.asar.unpack
 let mainWindow = null;
 let overlayWindow = null;
 let selectedSourceId = null;
+let streamProc = null;
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -176,8 +177,12 @@ ipcMain.on('overlay:stop-clicked', () => {
 });
 ipcMain.on('window:minimize', () => { if (mainWindow) mainWindow.minimize(); });
 
-ipcMain.handle('recording:save', async (_e, arrayBuffer, label) => {
-  const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+ipcMain.on('shell:open-external', (_e, url) => {
+  if (/^https:\/\//.test(url)) shell.openExternal(url);
+});
+
+ipcMain.handle('recording:save', async (_e, arrayBuffer, label, sharedStamp) => {
+  const stamp = sharedStamp || new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
   const suffix = label ? '-' + String(label).replace(/[^a-z0-9_-]/gi, '') : '';
   let file = path.join(libraryDir(), `recording-${stamp}${suffix}.webm`);
   let n = 1;
@@ -298,6 +303,123 @@ ipcMain.handle('export:run', async (e, opts) => {
   return { output, size: fs.statSync(output).size };
 });
 
+// Screen + camera files saved from a split "both" recording share the same
+// timestamp stamp, e.g. recording-2026-07-09-12-00-00-screen.webm /
+// ...-camera.webm — that's how we find the sibling to build a Short from.
+function findPairedFile(filePath) {
+  const dir = path.dirname(filePath);
+  const name = path.basename(filePath);
+  const m = /^(recording-[\d-]+)-(screen|camera)(\.webm)$/.exec(name);
+  if (!m) return null;
+  const [, base, label, ext] = m;
+  const otherLabel = label === 'screen' ? 'camera' : 'screen';
+  const otherPath = path.join(dir, `${base}-${otherLabel}${ext}`);
+  return fs.existsSync(otherPath) ? { screenPath: label === 'screen' ? filePath : otherPath, cameraPath: label === 'camera' ? filePath : otherPath, base } : null;
+}
+
+ipcMain.handle('library:find-pair', async (_e, filePath) => {
+  const pair = findPairedFile(filePath);
+  return pair ? { screenPath: pair.screenPath, cameraPath: pair.cameraPath } : null;
+});
+
+ipcMain.handle('shorts:build', async (e, opts) => {
+  const { screenPath, cameraPath, cameraOnTop } = opts;
+  const base = path.basename(screenPath).replace(/-screen\.webm$/, '');
+  let output = path.join(libraryDir(), `${base}-short.mp4`);
+  let n = 1;
+  while (fs.existsSync(output)) output = path.join(libraryDir(), `${base}-short-${n++}.mp4`);
+
+  const topPath = cameraOnTop ? cameraPath : screenPath;
+  const bottomPath = cameraOnTop ? screenPath : cameraPath;
+  const audioIdx = cameraOnTop ? 1 : 0; // prefer the screen track's audio (full mixed mic+system)
+
+  const screenDur = await ffprobeDuration(screenPath);
+  const camDur = await ffprobeDuration(cameraPath);
+  const outDur = Math.min(screenDur || Infinity, camDur || Infinity);
+  const sendProgress = (secs) => {
+    if (outDur && Number.isFinite(outDur)) e.sender.send('shorts:progress', { output, percent: Math.min(99, Math.round((secs / outDur) * 100)) });
+  };
+
+  await runFfmpeg([
+    '-i', topPath,
+    '-i', bottomPath,
+    '-filter_complex',
+    '[0:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[top];' +
+    '[1:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[bottom];' +
+    '[top][bottom]vstack=inputs=2[v]',
+    '-map', '[v]', '-map', `${audioIdx}:a?`,
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '160k',
+    '-shortest',
+    output
+  ], sendProgress);
+
+  e.sender.send('shorts:progress', { output, percent: 100 });
+  await ensureThumbnail(output);
+  return { output, size: fs.statSync(output).size };
+});
+
+// ---------------------------------------------------------------------------
+// Live streaming (RTMP)
+// ---------------------------------------------------------------------------
+ipcMain.handle('stream:start', async (e, opts) => {
+  if (streamProc) throw new Error('A stream is already live');
+  const { target } = opts;
+  if (!target) throw new Error('Missing RTMP target');
+
+  const proc = spawn(ffmpegPath, [
+    '-hide_banner', '-loglevel', 'warning',
+    '-f', 'webm', '-i', 'pipe:0',
+    '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
+    '-b:v', '4500k', '-maxrate', '4500k', '-bufsize', '9000k',
+    '-pix_fmt', 'yuv420p', '-g', '60',
+    '-c:a', 'aac', '-b:a', '160k', '-ar', '44100',
+    '-f', 'flv', target
+  ], { windowsHide: true });
+
+  streamProc = proc;
+  let stderr = '';
+
+  proc.stderr.on('data', (d) => {
+    stderr += d.toString();
+    if (stderr.length > 8000) stderr = stderr.slice(-4000);
+  });
+
+  proc.on('error', (err) => {
+    if (streamProc === proc) streamProc = null;
+    if (mainWindow) mainWindow.webContents.send('stream:status', { type: 'error', message: err.message });
+  });
+
+  proc.on('close', (code) => {
+    if (streamProc === proc) streamProc = null;
+    if (mainWindow) {
+      mainWindow.webContents.send('stream:status', {
+        type: code === 0 ? 'ended' : 'error',
+        message: code === 0 ? null : `ffmpeg exited with code ${code}\n${stderr.slice(-1000)}`
+      });
+    }
+  });
+
+  return { ok: true };
+});
+
+ipcMain.on('stream:chunk', (_e, buf) => {
+  if (streamProc && streamProc.stdin.writable) {
+    streamProc.stdin.write(Buffer.from(buf));
+  }
+});
+
+ipcMain.handle('stream:stop', async () => {
+  const proc = streamProc;
+  streamProc = null;
+  if (!proc) return { ok: true };
+  return new Promise((resolve) => {
+    const t = setTimeout(() => { try { proc.kill(); } catch {} resolve({ ok: true }); }, 4000);
+    proc.once('close', () => { clearTimeout(t); resolve({ ok: true }); });
+    try { proc.stdin.end(); } catch { clearTimeout(t); resolve({ ok: true }); }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // App lifecycle
 // ---------------------------------------------------------------------------
@@ -370,4 +492,8 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', () => {
+  if (streamProc) { try { streamProc.kill(); } catch {} streamProc = null; }
 });

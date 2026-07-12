@@ -170,6 +170,8 @@ async function loadDevices() {
 
   fillDeviceSelect($('#camera-select'), devices.filter((d) => d.kind === 'videoinput'), 'Camera');
   fillDeviceSelect($('#mic-select'), devices.filter((d) => d.kind === 'audioinput'), 'Microphone');
+  fillDeviceSelect($('#live-camera-select'), devices.filter((d) => d.kind === 'videoinput'), 'Camera');
+  fillDeviceSelect($('#live-mic-select'), devices.filter((d) => d.kind === 'audioinput'), 'Microphone');
 }
 
 function fillDeviceSelect(sel, list, kindName) {
@@ -313,7 +315,9 @@ function makeRecorder(videoTrack, audioTrack, label) {
 }
 
 // Composite screen + camera into one canvas stream (picture-in-picture).
-async function makeCompositeStream(screenTrack, camTrack) {
+// getPos(), if provided, returns { xPct, yPct, wPct } (0-1 fractions of the
+// canvas) for the camera box each frame; defaults to a fixed bottom-right PiP.
+async function makeCompositeStream(screenTrack, camTrack, getPos) {
   const mkVideo = (track) => new Promise((resolve) => {
     const v = document.createElement('video');
     v.muted = true; v.playsInline = true;
@@ -328,16 +332,19 @@ async function makeCompositeStream(screenTrack, camTrack) {
   const ctx = canvas.getContext('2d');
   let raf = 0, live = true;
 
+  const defaultPos = () => ({ xPct: null, yPct: null, wPct: 0.22 });
+
   const draw = () => {
     if (!live) return;
     try {
       ctx.drawImage(sv, 0, 0, w, h);
-      const pw = Math.round(w * 0.22);
+      const pos = (getPos ? getPos() : null) || defaultPos();
+      const pw = Math.round(w * (pos.wPct || 0.22));
       const ar = (cv.videoWidth || 16) / (cv.videoHeight || 9);
       const ph = Math.round(pw / ar);
       const m = Math.round(w * 0.02);
-      const x = w - pw - m;
-      const y = h - ph - m;
+      const x = pos.xPct == null ? (w - pw - m) : Math.round(pos.xPct * w);
+      const y = pos.yPct == null ? (h - ph - m) : Math.round(pos.yPct * h);
       ctx.save();
       ctx.shadowColor = 'rgba(0,0,0,0.55)';
       ctx.shadowBlur = Math.round(w * 0.012);
@@ -496,12 +503,13 @@ async function finalizeRecording() {
     return;
   }
 
+  const sharedStamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
   const savedNames = [];
   for (const r of toSave) {
     const blob = new Blob(r.chunks, { type: 'video/webm' });
     try {
       const buf = await blob.arrayBuffer();
-      const file = await window.api.saveRecording(buf, r.label || null);
+      const file = await window.api.saveRecording(buf, r.label || null, sharedStamp);
       savedNames.push(file.split(/[\\/]/).pop());
     } catch (err) {
       toast('Failed to save ' + (r.label || 'recording') + ': ' + err.message, true);
@@ -522,6 +530,326 @@ $('#record-btn').addEventListener('click', () => {
 });
 
 window.api.onStopRequested(() => stopRecording());
+
+// ---------------------------------------------------------------------------
+// Go Live (RTMP streaming)
+// ---------------------------------------------------------------------------
+let liveSources = [];
+let liveSourceKind = 'screen';
+let liveSelectedSource = null;
+let livePreviewDisplay = null;   // persistent screen preview stream, reused when going live
+let liveCamPreviewStream = null; // persistent camera preview stream, reused when going live
+
+let liveCamPos = { xPct: 0.75, yPct: 0.72, wPct: 0.22 }; // fractions of the canvas
+let dragState = null; // { mode: 'move'|'resize', startX, startY, startPos }
+
+let liveActive = false;
+let liveRecorder = null;
+let liveChunks = [];
+let liveCleanup = [];
+let liveCtx = null; // { micStream, audioCtx }
+let liveTimerInterval = null;
+let liveStartedAt = 0;
+
+async function loadLiveSources() {
+  const grid = $('#live-sources-grid');
+  try {
+    liveSources = await window.api.listSources();
+  } catch (err) {
+    grid.innerHTML = '<div class="empty">Failed to list sources: ' + err.message + '</div>';
+    return;
+  }
+  renderLiveSources();
+}
+
+function renderLiveSources() {
+  const grid = $('#live-sources-grid');
+  const filtered = liveSources.filter((s) => s.kind === liveSourceKind);
+  if (!filtered.length) {
+    grid.innerHTML = '<div class="empty">No ' + liveSourceKind + 's found.</div>';
+    return;
+  }
+  grid.innerHTML = '';
+  for (const s of filtered) {
+    const card = document.createElement('div');
+    card.className = 'source-card' + (liveSelectedSource && liveSelectedSource.id === s.id ? ' selected' : '');
+    const img = document.createElement('img');
+    img.src = s.thumbnail;
+    const label = document.createElement('div');
+    label.className = 'label';
+    label.textContent = s.name;
+    card.append(img, label);
+    card.addEventListener('click', async () => {
+      liveSelectedSource = s;
+      window.api.selectSource(s.id);
+      document.querySelectorAll('#live-sources-grid .source-card').forEach((c) => c.classList.remove('selected'));
+      card.classList.add('selected');
+      updateLiveButton();
+      await startLivePreviewScreen();
+    });
+    grid.appendChild(card);
+  }
+}
+
+document.querySelectorAll('[data-live-kind]').forEach((tab) => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('[data-live-kind]').forEach((t) => t.classList.remove('active'));
+    tab.classList.add('active');
+    liveSourceKind = tab.dataset.liveKind;
+    renderLiveSources();
+  });
+});
+
+$('#refresh-live-sources').addEventListener('click', loadLiveSources);
+
+async function startLivePreviewScreen() {
+  if (livePreviewDisplay) { livePreviewDisplay.getTracks().forEach((t) => t.stop()); livePreviewDisplay = null; }
+  try {
+    livePreviewDisplay = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    $('#live-preview-video').srcObject = livePreviewDisplay;
+    $('#live-preview-empty').classList.add('hidden');
+    $('#live-cam-box').classList.remove('hidden');
+    positionCamBox();
+    livePreviewDisplay.getVideoTracks()[0].addEventListener('ended', () => {
+      if (liveActive) stopLive();
+      livePreviewDisplay = null;
+      $('#live-preview-video').srcObject = null;
+      $('#live-preview-empty').textContent = 'Pick a screen source above to preview placement';
+      $('#live-preview-empty').classList.remove('hidden');
+      $('#live-cam-box').classList.add('hidden');
+    });
+  } catch (err) {
+    $('#live-preview-empty').textContent = 'Preview unavailable: ' + err.message;
+    $('#live-preview-empty').classList.remove('hidden');
+  }
+  updateLiveButton();
+}
+
+async function startLiveCameraPreview() {
+  if (liveCamPreviewStream) { liveCamPreviewStream.getTracks().forEach((t) => t.stop()); liveCamPreviewStream = null; }
+  const devId = $('#live-camera-select').value;
+  if (!devId) { updateLiveButton(); return; }
+  try {
+    liveCamPreviewStream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: { exact: devId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
+    $('#live-cam-box-video').srcObject = liveCamPreviewStream;
+  } catch { /* camera unavailable — Go Live stays disabled */ }
+  updateLiveButton();
+}
+
+$('#live-camera-select').addEventListener('change', startLiveCameraPreview);
+
+// ---- Camera box drag/resize (positions expressed as fractions of the preview) ----
+function positionCamBox() {
+  const wrap = $('#live-preview-wrap');
+  const box = $('#live-cam-box');
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  const bw = Math.round(w * liveCamPos.wPct);
+  const bh = Math.round(bw * 9 / 16);
+  box.style.width = bw + 'px';
+  box.style.height = bh + 'px';
+  box.style.left = Math.round(liveCamPos.xPct * w) + 'px';
+  box.style.top = Math.round(liveCamPos.yPct * h) + 'px';
+}
+
+$('#live-cam-box').addEventListener('pointerdown', (e) => {
+  if (e.target === $('#live-cam-resize')) return;
+  const wrap = $('#live-preview-wrap');
+  dragState = { mode: 'move', startX: e.clientX, startY: e.clientY, startPos: { ...liveCamPos }, w: wrap.clientWidth, h: wrap.clientHeight };
+  e.preventDefault();
+});
+$('#live-cam-resize').addEventListener('pointerdown', (e) => {
+  const wrap = $('#live-preview-wrap');
+  dragState = { mode: 'resize', startX: e.clientX, startY: e.clientY, startPos: { ...liveCamPos }, w: wrap.clientWidth, h: wrap.clientHeight };
+  e.stopPropagation();
+  e.preventDefault();
+});
+window.addEventListener('pointermove', (e) => {
+  if (!dragState) return;
+  const dx = (e.clientX - dragState.startX) / dragState.w;
+  const dy = (e.clientY - dragState.startY) / dragState.h;
+  if (dragState.mode === 'move') {
+    liveCamPos.xPct = Math.min(1 - liveCamPos.wPct, Math.max(0, dragState.startPos.xPct + dx));
+    const bh = liveCamPos.wPct * (9 / 16);
+    liveCamPos.yPct = Math.min(1 - bh, Math.max(0, dragState.startPos.yPct + dy));
+  } else {
+    liveCamPos.wPct = Math.min(0.6, Math.max(0.1, dragState.startPos.wPct + dx));
+  }
+  positionCamBox();
+});
+window.addEventListener('pointerup', () => { dragState = null; });
+window.addEventListener('resize', () => { if (!$('#live-cam-box').classList.contains('hidden')) positionCamBox(); });
+
+// ---- Service tabs (Twitch / Custom RTMP) ----
+document.querySelectorAll('.mode-btn[data-service]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.mode-btn[data-service]').forEach((b) => b.classList.toggle('active', b === btn));
+    const svc = btn.dataset.service;
+    $('#service-twitch').classList.toggle('hidden', svc !== 'twitch');
+    $('#service-custom').classList.toggle('hidden', svc !== 'custom');
+    updateLiveButton();
+  });
+});
+
+$('#twitch-connect').addEventListener('click', () => {
+  window.api.openExternal('https://dashboard.twitch.tv/settings/stream');
+});
+
+$('#twitch-key').addEventListener('input', updateLiveButton);
+$('#custom-url').addEventListener('input', updateLiveButton);
+$('#custom-key').addEventListener('input', updateLiveButton);
+
+function activeService() {
+  return document.querySelector('.mode-btn[data-service].active')?.dataset.service || 'twitch';
+}
+
+function buildStreamTarget() {
+  if (activeService() === 'twitch') {
+    const key = $('#twitch-key').value.trim();
+    return key ? 'rtmp://live.twitch.tv/app/' + key : null;
+  }
+  const url = $('#custom-url').value.trim();
+  const key = $('#custom-key').value.trim();
+  if (!url) return null;
+  return url.replace(/\/+$/, '') + (key ? '/' + key : '');
+}
+
+function updateLiveButton() {
+  if (liveActive) { $('#live-btn').disabled = false; return; }
+  const ok = !!livePreviewDisplay && !!liveCamPreviewStream && !!buildStreamTarget();
+  $('#live-btn').disabled = !ok;
+}
+
+async function startLive() {
+  const target = buildStreamTarget();
+  if (!livePreviewDisplay) { toast('Pick a screen source first', true); return; }
+  if (!liveCamPreviewStream) { toast('Pick a camera first', true); return; }
+  if (!target) { toast('Enter your stream key / RTMP details first', true); return; }
+
+  let micStream = null, audioCtx = null;
+  const pos = { ...liveCamPos };
+
+  try {
+    const screenTrack = livePreviewDisplay.getVideoTracks()[0];
+    const camTrack = liveCamPreviewStream.getVideoTracks()[0];
+    const systemAudioStream = livePreviewDisplay.getAudioTracks().length
+      ? new MediaStream([livePreviewDisplay.getAudioTracks()[0]]) : null;
+
+    if ($('#live-mic-toggle').checked) {
+      const micId = $('#live-mic-select').value;
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { deviceId: micId ? { exact: micId } : undefined, echoCancellation: true, noiseSuppression: true }
+        });
+      } catch (err) {
+        toast('Mic unavailable, going live without it (' + err.message + ')', true);
+      }
+    }
+
+    const audio = buildAudioGraph(systemAudioStream, micStream);
+    audioCtx = audio.ctx;
+
+    const comp = await makeCompositeStream(screenTrack, camTrack, () => pos);
+    liveCleanup = [comp.cleanup];
+
+    await window.api.streamStart({ target });
+
+    const outStream = new MediaStream([comp.stream.getVideoTracks()[0]]);
+    const audioTrack = audio.makeTrack();
+    if (audioTrack) outStream.addTrack(audioTrack);
+
+    liveChunks = [];
+    liveRecorder = new MediaRecorder(outStream, { mimeType: pickMimeType(), videoBitsPerSecond: 6_000_000 });
+    liveRecorder.ondataavailable = async (e) => {
+      if (!e.data.size) return;
+      liveChunks.push(e.data);
+      try {
+        const buf = await e.data.arrayBuffer();
+        window.api.streamChunk(buf);
+      } catch { /* ignore a dropped chunk */ }
+    };
+    liveRecorder.start(500);
+
+    liveCtx = { micStream, audioCtx };
+    liveActive = true;
+    liveStartedAt = Date.now();
+    updateLiveUI(true);
+  } catch (err) {
+    toast('Could not go live: ' + err.message, true);
+    if (micStream) micStream.getTracks().forEach((t) => t.stop());
+    if (audioCtx) audioCtx.close().catch(() => {});
+    for (const c of liveCleanup) c();
+    liveCleanup = [];
+    try { await window.api.streamStop(); } catch {}
+  }
+}
+
+function stopLive() {
+  if (!liveActive) return;
+  liveActive = false;
+  if (liveRecorder && liveRecorder.state !== 'inactive') {
+    liveRecorder.onstop = finalizeLive;
+    liveRecorder.stop();
+  } else {
+    finalizeLive();
+  }
+}
+
+async function finalizeLive() {
+  await window.api.streamStop();
+
+  const ctx = liveCtx || {};
+  if (ctx.micStream) ctx.micStream.getTracks().forEach((t) => t.stop());
+  for (const c of liveCleanup) { try { c(); } catch {} }
+  liveCleanup = [];
+  if (ctx.audioCtx) ctx.audioCtx.close().catch(() => {});
+  liveCtx = null;
+  liveRecorder = null;
+
+  updateLiveUI(false);
+
+  const chunks = liveChunks;
+  liveChunks = [];
+  if (chunks.length) {
+    const blob = new Blob(chunks, { type: 'video/webm' });
+    try {
+      const buf = await blob.arrayBuffer();
+      const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+      const file = await window.api.saveRecording(buf, 'live', stamp);
+      toast('Stream ended. Saved: ' + file.split(/[\\/]/).pop());
+    } catch (err) {
+      toast('Stream ended, but saving the local copy failed: ' + err.message, true);
+    }
+  } else {
+    toast('Stream ended.');
+  }
+}
+
+function updateLiveUI(active) {
+  const btn = $('#live-btn');
+  btn.classList.toggle('recording', active);
+  $('#live-btn-label').textContent = active ? 'End stream' : 'Go live';
+  $('#live-timer').classList.toggle('hidden', !active);
+  clearInterval(liveTimerInterval);
+  if (active) {
+    liveTimerInterval = setInterval(() => {
+      $('#live-timer-text').textContent = fmtTime((Date.now() - liveStartedAt) / 1000);
+    }, 250);
+  }
+  updateLiveButton();
+}
+
+$('#live-btn').addEventListener('click', () => {
+  if (liveActive) stopLive(); else startLive();
+});
+
+window.api.onStreamStatus(({ type, message }) => {
+  if (type === 'error') {
+    toast('Stream error: ' + (message || 'connection failed'), true, 6000);
+    if (liveActive) stopLive();
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Library
@@ -576,8 +904,12 @@ $('#open-folder').addEventListener('click', () => window.api.openFolder());
 // ---------------------------------------------------------------------------
 // Modal: player + trim + export
 // ---------------------------------------------------------------------------
+let currentPair = null;
+let buildingShort = false;
+
 async function openModal(item) {
   currentItem = item;
+  currentPair = null;
   $('#modal-title').textContent = item.name;
   const player = $('#player');
   player.src = item.url;
@@ -585,6 +917,8 @@ async function openModal(item) {
   $('#trim-end').value = '';
   $('#trim-meta').textContent = '';
   $('#export-progress').classList.add('hidden');
+  $('#short-block').classList.add('hidden');
+  $('#short-progress').classList.add('hidden');
   $('#modal').classList.remove('hidden');
 
   const canExport = item.ext !== 'gif';
@@ -597,6 +931,16 @@ async function openModal(item) {
   if (dur) {
     $('#trim-end').value = dur.toFixed(1);
     $('#trim-meta').textContent = 'Duration: ' + dur.toFixed(1) + 's';
+  }
+
+  if (item.ext === 'webm') {
+    try {
+      currentPair = await window.api.findPair(item.path);
+      if (currentPair) {
+        $('#short-block').classList.remove('hidden');
+        $('#build-short').disabled = buildingShort;
+      }
+    } catch { /* no pair, ignore */ }
   }
 }
 
@@ -671,10 +1015,47 @@ window.api.onExportProgress(({ percent }) => {
 $('#export-mp4').addEventListener('click', () => runExport('mp4'));
 $('#export-gif').addEventListener('click', () => runExport('gif'));
 
+$('#build-short').addEventListener('click', async () => {
+  if (!currentPair || buildingShort) return;
+  buildingShort = true;
+  const progWrap = $('#short-progress');
+  const fill = $('#short-progress-fill');
+  const label = $('#short-progress-label');
+  progWrap.classList.remove('hidden');
+  fill.style.width = '0%';
+  label.textContent = 'Building… 0%';
+  $('#build-short').disabled = true;
+
+  try {
+    const res = await window.api.buildShort({
+      screenPath: currentPair.screenPath,
+      cameraPath: currentPair.cameraPath,
+      cameraOnTop: $('#short-cam-top').checked
+    });
+    fill.style.width = '100%';
+    label.textContent = 'Done → ' + res.output.split(/[\\/]/).pop() + ' (' + fmtSize(res.size) + ')';
+    toast('Short built');
+    renderLibrary();
+  } catch (err) {
+    label.textContent = 'Build failed';
+    toast('Build Short failed: ' + err.message, true, 6000);
+  } finally {
+    buildingShort = false;
+    $('#build-short').disabled = false;
+  }
+});
+
+window.api.onShortsProgress(({ percent }) => {
+  if (!buildingShort) return;
+  $('#short-progress-fill').style.width = percent + '%';
+  $('#short-progress-label').textContent = 'Building… ' + percent + '%';
+});
+
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 loadSources();
-loadDevices().then(() => { updateRecordButton(); updateHint(); });
+loadDevices().then(() => { updateRecordButton(); updateHint(); startLiveCameraPreview(); });
 loadOutputDir();
 renderLibrary();
+loadLiveSources();

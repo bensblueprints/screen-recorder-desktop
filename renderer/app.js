@@ -1004,6 +1004,8 @@ async function openModal(item) {
   $('#add-captions').disabled = !canTranscribe || capturingCaptions;
   $('#reels-block').classList.toggle('hidden', !canTranscribe);
   $('#make-reels').disabled = !canTranscribe || makingReels;
+  $('#silence-entry-block').classList.toggle('hidden', !canTranscribe);
+  $('#open-silence-editor').disabled = !canTranscribe;
   $('#captions-preview').classList.toggle('hidden', !canTranscribe);
   captionsPos = { ...CAPTION_PRESETS.bottom };
   document.querySelectorAll('.chip[data-caption-preset]').forEach((c) => c.classList.toggle('active', c.dataset.captionPreset === 'bottom'));
@@ -1340,6 +1342,224 @@ window.api.onReelsProgress((p) => {
   const label = $('#reels-progress-label');
   if (typeof p.percent === 'number') fill.style.width = p.percent + '%';
   label.textContent = describeProgress(p);
+});
+
+// ---------------------------------------------------------------------------
+// Silence Editor — detect, review (trim/delete/undo), apply
+// ---------------------------------------------------------------------------
+let silenceItem = null;
+let silenceDuration = 0;
+let silences = []; // [{id, start, end}]
+let silenceIdCounter = 0;
+let deletedSilenceIds = new Set();
+let undoStack = []; // ids, in delete order — undo pops the most recent
+let detectingSilences = false;
+let applyingSilenceCuts = false;
+
+function openSilenceEditor(item) {
+  if (!item) return;
+  silenceItem = item;
+  silences = [];
+  deletedSilenceIds = new Set();
+  undoStack = [];
+  silenceDuration = 0;
+  $('#silence-modal-title').textContent = 'Remove Silences — ' + item.name;
+  $('#silence-player').src = item.url;
+  $('#silence-replace').checked = false;
+  $('#silence-progress').classList.add('hidden');
+  renderSilenceList();
+  $('#silence-modal').classList.remove('hidden');
+}
+
+function closeSilenceEditor() {
+  const player = $('#silence-player');
+  player.pause();
+  player.removeAttribute('src');
+  player.load();
+  $('#silence-modal').classList.add('hidden');
+  silenceItem = null;
+}
+
+$('#open-silence-editor').addEventListener('click', () => openSilenceEditor(currentItem));
+$('#silence-modal-close').addEventListener('click', closeSilenceEditor);
+$('#silence-modal').addEventListener('click', (e) => { if (e.target === $('#silence-modal')) closeSilenceEditor(); });
+
+function fmtT(t) { return t.toFixed(2); }
+
+function renderSilenceTimeline() {
+  const wrap = $('#silence-timeline');
+  const track = $('#silence-timeline-track');
+  if (!silences.length || !silenceDuration) { wrap.classList.add('hidden'); return; }
+  wrap.classList.remove('hidden');
+  track.innerHTML = '';
+  for (const s of silences) {
+    const el = document.createElement('div');
+    el.className = 'silence-seg' + (deletedSilenceIds.has(s.id) ? ' deleted' : '');
+    el.style.left = (s.start / silenceDuration * 100) + '%';
+    el.style.width = Math.max(0.3, (s.end - s.start) / silenceDuration * 100) + '%';
+    el.title = `${fmtT(s.start)}s → ${fmtT(s.end)}s`;
+    track.appendChild(el);
+  }
+}
+
+function renderSilenceList() {
+  const list = $('#silence-list');
+  renderSilenceTimeline();
+
+  const deletedCount = [...deletedSilenceIds].length;
+  $('#silence-undo').disabled = undoStack.length === 0;
+  $('#apply-silence-cuts').disabled = deletedCount === 0 || applyingSilenceCuts;
+
+  if (!silences.length) {
+    list.innerHTML = '<div class="empty">Click "Detect Silences" to scan this clip.</div>';
+    return;
+  }
+
+  list.innerHTML = '';
+  silences.forEach((s, i) => {
+    const row = document.createElement('div');
+    row.className = 'silence-row' + (deletedSilenceIds.has(s.id) ? ' deleted' : '');
+
+    const idx = document.createElement('span');
+    idx.className = 'silence-index';
+    idx.textContent = '#' + (i + 1);
+
+    const time = document.createElement('span');
+    time.className = 'silence-time';
+    const startInput = document.createElement('input');
+    startInput.type = 'number'; startInput.step = '0.1'; startInput.min = '0';
+    startInput.value = fmtT(s.start);
+    const arrow = document.createElement('span');
+    arrow.textContent = '→';
+    const endInput = document.createElement('input');
+    endInput.type = 'number'; endInput.step = '0.1'; endInput.min = '0';
+    endInput.value = fmtT(s.end);
+    time.append(startInput, arrow, endInput);
+
+    const onTrim = () => {
+      let newStart = Math.max(0, parseFloat(startInput.value) || 0);
+      let newEnd = Math.max(0, parseFloat(endInput.value) || 0);
+      if (silenceDuration) { newStart = Math.min(newStart, silenceDuration); newEnd = Math.min(newEnd, silenceDuration); }
+      if (newEnd <= newStart) newEnd = newStart + 0.1;
+      s.start = newStart; s.end = newEnd;
+      startInput.value = fmtT(s.start); endInput.value = fmtT(s.end);
+      renderSilenceTimeline();
+    };
+    startInput.addEventListener('change', onTrim);
+    endInput.addEventListener('change', onTrim);
+
+    const dur = document.createElement('span');
+    dur.className = 'silence-dur';
+    dur.textContent = fmtT(s.end - s.start) + 's';
+
+    const spacer = document.createElement('span');
+    spacer.className = 'spacer';
+
+    const previewBtn = document.createElement('button');
+    previewBtn.className = 'ghost-btn';
+    previewBtn.textContent = '▶';
+    previewBtn.title = 'Preview this segment';
+    previewBtn.addEventListener('click', () => {
+      const player = $('#silence-player');
+      player.currentTime = s.start;
+      player.play();
+      const onTick = () => {
+        if (player.currentTime >= s.end) { player.pause(); player.removeEventListener('timeupdate', onTick); }
+      };
+      player.addEventListener('timeupdate', onTick);
+    });
+
+    const delBtn = document.createElement('button');
+    const isDeleted = deletedSilenceIds.has(s.id);
+    delBtn.className = isDeleted ? 'ghost-btn' : 'danger-btn';
+    delBtn.textContent = isDeleted ? 'Restore' : 'Delete';
+    delBtn.addEventListener('click', () => {
+      if (deletedSilenceIds.has(s.id)) {
+        deletedSilenceIds.delete(s.id);
+        undoStack = undoStack.filter((id) => id !== s.id);
+      } else {
+        deletedSilenceIds.add(s.id);
+        undoStack.push(s.id);
+      }
+      renderSilenceList();
+    });
+
+    row.append(idx, time, dur, spacer, previewBtn, delBtn);
+    list.appendChild(row);
+  });
+}
+
+$('#detect-silences').addEventListener('click', async () => {
+  if (!silenceItem || detectingSilences) return;
+  detectingSilences = true;
+  $('#detect-silences').disabled = true;
+  $('#silence-list').innerHTML = '<div class="empty">Scanning for silence…</div>';
+  try {
+    const res = await window.api.detectSilences({
+      input: silenceItem.path,
+      sensitivity: $('#silence-sensitivity').value,
+      minDuration: parseFloat($('#silence-min-len').value)
+    });
+    silenceDuration = res.duration || 0;
+    silences = res.silences.map((s) => ({ id: silenceIdCounter++, start: s.start, end: s.end }));
+    deletedSilenceIds = new Set();
+    undoStack = [];
+    renderSilenceList();
+    toast(silences.length ? `Found ${silences.length} silence${silences.length === 1 ? '' : 's'}` : 'No silences found');
+  } catch (err) {
+    $('#silence-list').innerHTML = '<div class="empty">Detection failed: ' + err.message + '</div>';
+    toast('Detect Silences failed: ' + err.message, true, 6000);
+  } finally {
+    detectingSilences = false;
+    $('#detect-silences').disabled = false;
+  }
+});
+
+$('#silence-undo').addEventListener('click', () => {
+  if (!undoStack.length) return;
+  const id = undoStack.pop();
+  deletedSilenceIds.delete(id);
+  renderSilenceList();
+});
+
+$('#apply-silence-cuts').addEventListener('click', async () => {
+  if (!silenceItem || applyingSilenceCuts) return;
+  const cuts = silences.filter((s) => deletedSilenceIds.has(s.id)).map((s) => ({ start: s.start, end: s.end }));
+  if (!cuts.length) return;
+  applyingSilenceCuts = true;
+  const progWrap = $('#silence-progress');
+  const fill = $('#silence-progress-fill');
+  const label = $('#silence-progress-label');
+  progWrap.classList.remove('hidden');
+  fill.style.width = '2%';
+  label.textContent = 'Removing… 0%';
+  $('#apply-silence-cuts').disabled = true;
+
+  try {
+    const res = await window.api.applySilenceCuts({
+      input: silenceItem.path,
+      cuts,
+      replace: $('#silence-replace').checked
+    });
+    fill.style.width = '100%';
+    label.textContent = 'Done → ' + res.output.split(/[\\/]/).pop() + ' (' + fmtSize(res.size) + ')';
+    toast(`Removed ${cuts.length} silence${cuts.length === 1 ? '' : 's'}`);
+    renderLibrary();
+    closeSilenceEditor();
+  } catch (err) {
+    label.textContent = 'Apply failed';
+    toast('Apply Cuts failed: ' + err.message, true, 6000);
+  } finally {
+    applyingSilenceCuts = false;
+    $('#apply-silence-cuts').disabled = deletedSilenceIds.size === 0;
+  }
+});
+
+window.api.onSilenceProgress((p) => {
+  if (!applyingSilenceCuts) return;
+  const fill = $('#silence-progress-fill');
+  const label = $('#silence-progress-label');
+  if (typeof p.percent === 'number') { fill.style.width = p.percent + '%'; label.textContent = 'Removing… ' + p.percent + '%'; }
 });
 
 // ---------------------------------------------------------------------------

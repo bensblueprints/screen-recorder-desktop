@@ -49,7 +49,7 @@ npm run dist
 
 Don't want to touch a terminal? Grab the packaged installer (one-time purchase, free updates forever):
 
-**→ [https://whop.com/onetime-suite](https://whop.com/onetime-suite)**
+**→ [https://whop.com/checkout/plan_Ma48eglvyofUF](https://whop.com/checkout/plan_Ma48eglvyofUF)**
 
 ## 🥊 vs. Loom
 

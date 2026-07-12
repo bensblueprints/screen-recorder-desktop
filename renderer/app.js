@@ -951,7 +951,19 @@ async function renderLibrary() {
     meta.append(fmtSize(item.size), new Date(item.mtime).toLocaleString());
     info.append(name, meta);
     card.append(thumb, info);
-    card.addEventListener('click', () => openModal(item));
+    card.dataset.path = item.path;
+
+    if (selectMode) {
+      card.classList.add('selectable');
+      if (selectedItems.has(item.path)) card.classList.add('selected');
+      const badge = document.createElement('div');
+      badge.className = 'lib-select-badge';
+      badge.textContent = selectedItems.has(item.path) ? '✓' : '';
+      card.appendChild(badge);
+      card.addEventListener('click', (e) => { e.stopPropagation(); toggleCardSelection(item.path, card); });
+    } else {
+      card.addEventListener('click', () => openModal(item));
+    }
     grid.appendChild(card);
   }
 }
@@ -964,6 +976,122 @@ document.querySelectorAll('.chip[data-filter]').forEach((chip) => {
     chip.classList.toggle('active', libFilters.has(f));
     renderLibrary();
   });
+});
+
+// ---------------------------------------------------------------------------
+// Library multi-select — click-to-toggle + drag rubber-band — and batch delete
+// ---------------------------------------------------------------------------
+let selectMode = false;
+let selectedItems = new Set(); // paths
+let rubberBandState = null;
+
+function toggleCardSelection(itemPath, cardEl) {
+  const badge = cardEl.querySelector('.lib-select-badge');
+  if (selectedItems.has(itemPath)) {
+    selectedItems.delete(itemPath);
+    cardEl.classList.remove('selected');
+    if (badge) badge.textContent = '';
+  } else {
+    selectedItems.add(itemPath);
+    cardEl.classList.add('selected');
+    if (badge) badge.textContent = '✓';
+  }
+  updateBatchToolbar();
+}
+
+function updateBatchToolbar() {
+  const n = selectedItems.size;
+  $('#batch-count').textContent = n + ' selected';
+  $('#batch-delete').disabled = n === 0;
+}
+
+$('#toggle-select-mode').addEventListener('click', () => {
+  selectMode = !selectMode;
+  $('#toggle-select-mode').classList.toggle('active', selectMode);
+  $('#toggle-select-mode').textContent = selectMode ? 'Done' : 'Select';
+  $('#batch-toolbar').classList.toggle('hidden', !selectMode);
+  if (!selectMode) selectedItems.clear();
+  updateBatchToolbar();
+  renderLibrary();
+});
+
+$('#batch-select-all').addEventListener('click', () => {
+  document.querySelectorAll('#library-grid .lib-card').forEach((card) => {
+    selectedItems.add(card.dataset.path);
+    card.classList.add('selected');
+    const badge = card.querySelector('.lib-select-badge');
+    if (badge) badge.textContent = '✓';
+  });
+  updateBatchToolbar();
+});
+
+$('#batch-clear').addEventListener('click', () => {
+  selectedItems.clear();
+  document.querySelectorAll('#library-grid .lib-card.selected').forEach((card) => {
+    card.classList.remove('selected');
+    const badge = card.querySelector('.lib-select-badge');
+    if (badge) badge.textContent = '';
+  });
+  updateBatchToolbar();
+});
+
+$('#batch-delete').addEventListener('click', async () => {
+  const paths = [...selectedItems];
+  if (!paths.length) return;
+  if (!window.confirm(`Delete ${paths.length} selected recording${paths.length === 1 ? '' : 's'}? This cannot be undone.`)) return;
+  $('#batch-delete').disabled = true;
+  let failed = 0;
+  for (const p of paths) {
+    try { await window.api.deleteRecording(p); } catch { failed++; }
+  }
+  selectedItems.clear();
+  toast(failed ? `Deleted ${paths.length - failed}, ${failed} failed` : `Deleted ${paths.length} recording${paths.length === 1 ? '' : 's'}`, !!failed);
+  updateBatchToolbar();
+  renderLibrary();
+});
+
+// Drag rubber-band select — only active in select mode, and only when the
+// drag starts on empty grid space (not on a card, which handles its own click).
+$('#library-grid').addEventListener('mousedown', (e) => {
+  if (!selectMode || e.target.closest('.lib-card')) return;
+  const box = document.createElement('div');
+  box.className = 'selection-box';
+  document.body.appendChild(box);
+  rubberBandState = { startX: e.clientX, startY: e.clientY, box };
+  e.preventDefault();
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (!rubberBandState) return;
+  const { startX, startY, box } = rubberBandState;
+  const x1 = Math.min(startX, e.clientX), x2 = Math.max(startX, e.clientX);
+  const y1 = Math.min(startY, e.clientY), y2 = Math.max(startY, e.clientY);
+  box.style.left = x1 + 'px';
+  box.style.top = y1 + 'px';
+  box.style.width = (x2 - x1) + 'px';
+  box.style.height = (y2 - y1) + 'px';
+
+  document.querySelectorAll('#library-grid .lib-card').forEach((card) => {
+    const r = card.getBoundingClientRect();
+    const intersects = !(r.right < x1 || r.left > x2 || r.bottom < y1 || r.top > y2);
+    card.classList.toggle('drag-hit', intersects);
+  });
+});
+
+window.addEventListener('mouseup', () => {
+  if (!rubberBandState) return;
+  document.querySelectorAll('#library-grid .lib-card.drag-hit').forEach((card) => {
+    card.classList.remove('drag-hit');
+    if (!selectedItems.has(card.dataset.path)) {
+      selectedItems.add(card.dataset.path);
+      card.classList.add('selected');
+      const badge = card.querySelector('.lib-select-badge');
+      if (badge) badge.textContent = '✓';
+    }
+  });
+  rubberBandState.box.remove();
+  rubberBandState = null;
+  updateBatchToolbar();
 });
 
 $('#open-folder').addEventListener('click', () => window.api.openFolder());

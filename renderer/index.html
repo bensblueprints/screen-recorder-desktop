@@ -242,6 +242,16 @@
             <button class="chip" data-filter="captioned" title="Show only captioned files">Captioned</button>
             <button class="chip" data-filter="reel" title="Show only reel clips">Reels</button>
           </div>
+          <div class="spacer"></div>
+          <button id="toggle-select-mode" class="ghost-btn">Select</button>
+        </div>
+        <div id="batch-toolbar" class="batch-toolbar hidden">
+          <span id="batch-count">0 selected</span>
+          <div class="hint-inline">Click videos to select, or drag across the grid.</div>
+          <div class="spacer"></div>
+          <button id="batch-select-all" class="ghost-btn">Select All</button>
+          <button id="batch-clear" class="ghost-btn">Clear</button>
+          <button id="batch-delete" class="danger-btn" disabled>Delete Selected</button>
         </div>
         <div id="library-grid" class="library-grid">
           <div class="empty">No recordings yet — make your first one!</div>

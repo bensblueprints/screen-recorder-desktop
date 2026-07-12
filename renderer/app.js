@@ -1219,11 +1219,14 @@ $('#make-reels').addEventListener('click', async () => {
       input: currentItem.path,
       maxLength: parseInt($('#reel-length').value, 10)
     });
+    const n = res.clips.length;
+    const capped = res.consideredCandidates > res.cappedAt;
+    const msg = n
+      ? `Made ${n} reel${n === 1 ? '' : 's'}` + (capped ? ` (capped at ${res.cappedAt} — more candidates were found)` : '')
+      : 'No standout moments found';
     fill.style.width = '100%';
-    label.textContent = res.clips.length
-      ? `Made ${res.clips.length} reel${res.clips.length === 1 ? '' : 's'}`
-      : 'No strong moments found';
-    toast(res.clips.length ? `Made ${res.clips.length} reel${res.clips.length === 1 ? '' : 's'}` : 'No standout moments found', !res.clips.length);
+    label.textContent = msg;
+    toast(msg, !n, capped ? 6000 : 3200);
     renderLibrary();
   } catch (err) {
     label.textContent = 'Reel generation failed';

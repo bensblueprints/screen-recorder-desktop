@@ -240,6 +240,102 @@ function cuesToSrt(cues) {
 }
 
 // ---------------------------------------------------------------------------
+// "Make Reels" — local heuristic viral-moment scoring
+//
+// This is NOT a virality predictor. It's a transcript/pace heuristic: words
+// that read as hooks (curiosity/urgency/superlatives), sentence-ending
+// emphasis (! / ?), dramatic pauses, and above-average speaking pace all
+// nudge a window's score up. It surfaces candidate moments worth a look —
+// nothing more.
+// ---------------------------------------------------------------------------
+const REEL_HOOK_WORDS = new Set([
+  'secret', 'secretly', 'never', 'always', 'biggest', 'worst', 'best', 'mistake', 'mistakes',
+  'nobody', 'everyone', 'crazy', 'insane', 'unbelievable', 'wow', 'stop', 'wait', 'listen',
+  'actually', 'literally', 'honestly', 'free', 'guarantee', 'guaranteed', 'hack', 'trick',
+  'warning', 'shocking', 'truth', 'lie', 'lied', 'scam', 'rich', 'money', 'million', 'billion',
+  'failed', 'fail', 'win', 'winning', 'hate', 'love', 'scared', 'afraid', 'danger', 'dangerous',
+  'proven', 'instantly', 'exposed', 'revealed', 'banned', 'illegal', 'why', 'how'
+]);
+
+function cleanWord(w) {
+  return w.toLowerCase().replace(/^[^a-z0-9%]+|[^a-z0-9%]+$/gi, '');
+}
+
+function scoreWords(words) {
+  return words.map((w, i) => {
+    let score = 0;
+    const clean = cleanWord(w.text);
+    if (REEL_HOOK_WORDS.has(clean)) score += 2;
+    if (/%$/.test(clean) || /^\d+$/.test(clean)) score += 1;
+    if (/[!?]$/.test(w.text.trim())) score += 1;
+    if (i > 0) {
+      const gap = w.start - words[i - 1].end;
+      if (gap > 0.5 && gap < 3) score += 1; // dramatic pause leading into this word
+    }
+    return score;
+  });
+}
+
+// Slides a window sized for the target clip length across the transcript and
+// scores each position by hook density + how much faster-than-average the
+// speaker is talking in that window.
+function scoreReelWindows(transcript, maxLength) {
+  const words = transcript.words;
+  if (!words.length) return [];
+  const wordScores = scoreWords(words);
+  const totalDur = words[words.length - 1].end;
+  const overallPace = words.length / Math.max(1, totalDur);
+  const target = Math.max(6, Math.min(maxLength - 2, maxLength * 0.85));
+  const stepSec = 2;
+
+  const candidates = [];
+  for (let t = 0; t + target <= totalDur; t += stepSec) {
+    const windowEnd = t + target;
+    let idxStart = -1, idxEnd = -1, hookSum = 0, count = 0;
+    for (let i = 0; i < words.length; i++) {
+      if (words[i].start >= t && words[i].end <= windowEnd) {
+        if (idxStart === -1) idxStart = i;
+        idxEnd = i;
+        hookSum += wordScores[i];
+        count++;
+      }
+    }
+    if (count < 4) continue;
+    const pace = count / target;
+    const paceScore = Math.max(0, (pace - overallPace) / Math.max(0.1, overallPace));
+    candidates.push({ start: words[idxStart].start, end: words[idxEnd].end, score: hookSum + paceScore * 3 });
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates;
+}
+
+// Greedily takes the highest-scoring windows, skipping any that overlap
+// (with a 1s buffer) an already-picked clip — "as many as it can find".
+function pickNonOverlapping(candidates, maxClips) {
+  const picked = [];
+  for (const c of candidates) {
+    if (picked.some((p) => c.start < p.end + 1 && c.end > p.start - 1)) continue;
+    picked.push(c);
+    if (picked.length >= maxClips) break;
+  }
+  return picked.sort((a, b) => a.start - b.start);
+}
+
+// Reframes to 9:16 via a centered scale+crop — same technique as Build Short.
+async function cutReelClip(input, ssStart, duration, output, onProgress) {
+  await runFfmpeg([
+    '-ss', String(Math.max(0, ssStart)),
+    '-i', input,
+    '-t', String(duration),
+    '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '160k',
+    '-movflags', '+faststart',
+    output
+  ], onProgress);
+}
+
+// ---------------------------------------------------------------------------
 // Windows
 // ---------------------------------------------------------------------------
 function createMainWindow() {
@@ -524,6 +620,48 @@ ipcMain.handle('captions:burn', async (e, opts) => {
   await ensureThumbnail(output);
   e.sender.send('captions:progress', { phase: 'done' });
   return { output, size: fs.statSync(output).size };
+});
+
+const REEL_MAX_CLIPS = 20; // sane ceiling on a single "make as many as it can" pass
+
+ipcMain.handle('reels:make', async (e, opts) => {
+  const { input, maxLength } = opts;
+  const cap = [15, 30, 60].includes(Number(maxLength)) ? Number(maxLength) : 30;
+  const dir = libraryDir();
+  const base = baseName(input);
+
+  const transcript = await transcribeVideo(input, (p) => e.sender.send('reels:progress', p));
+  e.sender.send('reels:progress', { phase: 'scoring' });
+
+  // Require at least one real signal (a hook word, or two weaker ones combined) —
+  // pace variance alone on flat/filler delivery shouldn't count as a "moment".
+  const candidates = scoreReelWindows(transcript, cap).filter((c) => c.score >= 2);
+  const picked = pickNonOverlapping(candidates, REEL_MAX_CLIPS);
+
+  const clips = [];
+  for (let i = 0; i < picked.length; i++) {
+    const c = picked[i];
+    const ssStart = Math.max(0, c.start - 0.2);
+    const duration = Math.min(cap, c.end + 0.4 - ssStart);
+
+    let output = path.join(dir, `${base}-reel-${i + 1}.mp4`);
+    let n = 1;
+    while (fs.existsSync(output)) output = path.join(dir, `${base}-reel-${i + 1}-${n++}.mp4`);
+
+    await cutReelClip(input, ssStart, duration, output, (secs) => {
+      e.sender.send('reels:progress', {
+        phase: 'cutting', index: i + 1, total: picked.length,
+        percent: Math.min(99, Math.round((secs / duration) * 100))
+      });
+    });
+
+    writeMeta(output, { isReel: true, parent: path.basename(input) });
+    await ensureThumbnail(output);
+    clips.push({ output, size: fs.statSync(output).size, start: ssStart, end: ssStart + duration, score: c.score });
+  }
+
+  e.sender.send('reels:progress', { phase: 'done' });
+  return { clips, consideredCandidates: candidates.length, cappedAt: REEL_MAX_CLIPS };
 });
 
 ipcMain.handle('export:run', async (e, opts) => {

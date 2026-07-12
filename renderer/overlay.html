@@ -26,22 +26,57 @@
     }
     button:hover { filter: brightness(1.15); }
     .sq { width: 10px; height: 10px; background: #fff; border-radius: 2px; }
+    #pause { background: #3a4152; }
+    .bars { display: flex; gap: 3px; }
+    .bars i { width: 3px; height: 11px; background: #fff; border-radius: 1px; display: block; }
+    .tri {
+      width: 0; height: 0; margin-left: 2px;
+      border-style: solid; border-width: 6px 0 6px 10px;
+      border-color: transparent transparent transparent #fff;
+    }
+    .dot.paused { animation: none; opacity: 0.35; background: #f59e0b; }
   </style>
 </head>
 <body>
   <div class="pill">
-    <span class="dot"></span>
+    <span class="dot" id="dot"></span>
     <span id="time">00:00</span>
     <button id="stop" title="Stop recording"><span class="sq"></span></button>
+    <button id="pause" title="Pause recording"><span class="bars"><i></i><i></i></span></button>
   </div>
   <script>
     const started = Date.now();
+    let pausedMs = 0;
+    let pauseStartedAt = null;
+    let paused = false;
+
+    function fmt(totalSeconds) {
+      return String(Math.floor(totalSeconds / 60)).padStart(2, '0') + ':' + String(totalSeconds % 60).padStart(2, '0');
+    }
+
     setInterval(() => {
-      const s = Math.floor((Date.now() - started) / 1000);
-      document.getElementById('time').textContent =
-        String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+      const now = paused ? pauseStartedAt : Date.now();
+      const s = Math.max(0, Math.floor((now - started - pausedMs) / 1000));
+      document.getElementById('time').textContent = fmt(s);
     }, 250);
+
     document.getElementById('stop').addEventListener('click', () => window.api.overlayStop());
+    document.getElementById('pause').addEventListener('click', () => window.api.overlayPauseToggle());
+
+    window.api.onPausedState((isPaused) => {
+      if (isPaused === paused) return;
+      paused = isPaused;
+      if (paused) {
+        pauseStartedAt = Date.now();
+      } else {
+        pausedMs += Date.now() - pauseStartedAt;
+        pauseStartedAt = null;
+      }
+      const btn = document.getElementById('pause');
+      btn.innerHTML = paused ? '<span class="tri"></span>' : '<span class="bars"><i></i><i></i></span>';
+      btn.title = paused ? 'Resume recording' : 'Pause recording';
+      document.getElementById('dot').classList.toggle('paused', paused);
+    });
   </script>
 </body>
 </html>

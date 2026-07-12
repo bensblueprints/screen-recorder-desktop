@@ -16,6 +16,9 @@ let stopping = false;
 
 let timerInterval = null;
 let recordStartedAt = 0;
+let isPaused = false;
+let totalPausedMs = 0;
+let pauseStartedAt = 0;
 let currentItem = null;            // library item open in modal
 let exporting = false;
 
@@ -170,6 +173,8 @@ async function loadDevices() {
 
   fillDeviceSelect($('#camera-select'), devices.filter((d) => d.kind === 'videoinput'), 'Camera');
   fillDeviceSelect($('#mic-select'), devices.filter((d) => d.kind === 'audioinput'), 'Microphone');
+  fillDeviceSelect($('#live-camera-select'), devices.filter((d) => d.kind === 'videoinput'), 'Camera');
+  fillDeviceSelect($('#live-mic-select'), devices.filter((d) => d.kind === 'audioinput'), 'Microphone');
 }
 
 function fillDeviceSelect(sel, list, kindName) {
@@ -313,7 +318,9 @@ function makeRecorder(videoTrack, audioTrack, label) {
 }
 
 // Composite screen + camera into one canvas stream (picture-in-picture).
-async function makeCompositeStream(screenTrack, camTrack) {
+// getPos(), if provided, returns { xPct, yPct, wPct } (0-1 fractions of the
+// canvas) for the camera box each frame; defaults to a fixed bottom-right PiP.
+async function makeCompositeStream(screenTrack, camTrack, getPos) {
   const mkVideo = (track) => new Promise((resolve) => {
     const v = document.createElement('video');
     v.muted = true; v.playsInline = true;
@@ -328,16 +335,19 @@ async function makeCompositeStream(screenTrack, camTrack) {
   const ctx = canvas.getContext('2d');
   let raf = 0, live = true;
 
+  const defaultPos = () => ({ xPct: null, yPct: null, wPct: 0.22 });
+
   const draw = () => {
     if (!live) return;
     try {
       ctx.drawImage(sv, 0, 0, w, h);
-      const pw = Math.round(w * 0.22);
+      const pos = (getPos ? getPos() : null) || defaultPos();
+      const pw = Math.round(w * (pos.wPct || 0.22));
       const ar = (cv.videoWidth || 16) / (cv.videoHeight || 9);
       const ph = Math.round(pw / ar);
       const m = Math.round(w * 0.02);
-      const x = w - pw - m;
-      const y = h - ph - m;
+      const x = pos.xPct == null ? (w - pw - m) : Math.round(pos.xPct * w);
+      const y = pos.yPct == null ? (h - ph - m) : Math.round(pos.yPct * h);
       ctx.save();
       ctx.shadowColor = 'rgba(0,0,0,0.55)';
       ctx.shadowBlur = Math.round(w * 0.012);
@@ -435,6 +445,9 @@ async function startRecording() {
     stopping = false;
     for (const r of recorders) r.recorder.start(1000);
     recordStartedAt = Date.now();
+    isPaused = false;
+    totalPausedMs = 0;
+    pauseStartedAt = 0;
 
     // UI
     const btn = $('#record-btn');
@@ -442,7 +455,8 @@ async function startRecording() {
     $('#record-btn-label').textContent = 'Stop recording';
     $('#rec-timer').classList.remove('hidden');
     timerInterval = setInterval(() => {
-      $('#rec-timer-text').textContent = fmtTime((Date.now() - recordStartedAt) / 1000);
+      const now = isPaused ? pauseStartedAt : Date.now();
+      $('#rec-timer-text').textContent = fmtTime((now - recordStartedAt - totalPausedMs) / 1000);
     }, 250);
 
     window.api.recordingStarted(); // spawns floating stop indicator
@@ -496,12 +510,13 @@ async function finalizeRecording() {
     return;
   }
 
+  const sharedStamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
   const savedNames = [];
   for (const r of toSave) {
     const blob = new Blob(r.chunks, { type: 'video/webm' });
     try {
       const buf = await blob.arrayBuffer();
-      const file = await window.api.saveRecording(buf, r.label || null);
+      const file = await window.api.saveRecording(buf, r.label || null, sharedStamp);
       savedNames.push(file.split(/[\\/]/).pop());
     } catch (err) {
       toast('Failed to save ' + (r.label || 'recording') + ': ' + err.message, true);
@@ -516,29 +531,386 @@ async function finalizeRecording() {
 }
 
 $('#record-btn').addEventListener('click', () => {
-  const recording = recorders.some((r) => r.recorder && r.recorder.state === 'recording');
+  const recording = recorders.some((r) => r.recorder && (r.recorder.state === 'recording' || r.recorder.state === 'paused'));
   if (recording) stopRecording();
   else startRecording();
 });
 
+function togglePauseRecording() {
+  const active = recorders.filter((r) => r.recorder.state !== 'inactive');
+  if (!active.length) return;
+  if (!isPaused) {
+    active.forEach((r) => { if (r.recorder.state === 'recording') r.recorder.pause(); });
+    isPaused = true;
+    pauseStartedAt = Date.now();
+  } else {
+    active.forEach((r) => { if (r.recorder.state === 'paused') r.recorder.resume(); });
+    totalPausedMs += Date.now() - pauseStartedAt;
+    pauseStartedAt = 0;
+    isPaused = false;
+  }
+  window.api.setOverlayPaused(isPaused);
+}
+
 window.api.onStopRequested(() => stopRecording());
+window.api.onPauseToggleRequested(() => togglePauseRecording());
+
+// ---------------------------------------------------------------------------
+// Go Live (RTMP streaming)
+// ---------------------------------------------------------------------------
+let liveSources = [];
+let liveSourceKind = 'screen';
+let liveSelectedSource = null;
+let livePreviewDisplay = null;   // persistent screen preview stream, reused when going live
+let liveCamPreviewStream = null; // persistent camera preview stream, reused when going live
+
+let liveCamPos = { xPct: 0.75, yPct: 0.72, wPct: 0.22 }; // fractions of the canvas
+let dragState = null; // { mode: 'move'|'resize', startX, startY, startPos }
+
+let liveActive = false;
+let liveRecorder = null;
+let liveChunks = [];
+let liveCleanup = [];
+let liveCtx = null; // { micStream, audioCtx }
+let liveTimerInterval = null;
+let liveStartedAt = 0;
+
+async function loadLiveSources() {
+  const grid = $('#live-sources-grid');
+  try {
+    liveSources = await window.api.listSources();
+  } catch (err) {
+    grid.innerHTML = '<div class="empty">Failed to list sources: ' + err.message + '</div>';
+    return;
+  }
+  renderLiveSources();
+}
+
+function renderLiveSources() {
+  const grid = $('#live-sources-grid');
+  const filtered = liveSources.filter((s) => s.kind === liveSourceKind);
+  if (!filtered.length) {
+    grid.innerHTML = '<div class="empty">No ' + liveSourceKind + 's found.</div>';
+    return;
+  }
+  grid.innerHTML = '';
+  for (const s of filtered) {
+    const card = document.createElement('div');
+    card.className = 'source-card' + (liveSelectedSource && liveSelectedSource.id === s.id ? ' selected' : '');
+    const img = document.createElement('img');
+    img.src = s.thumbnail;
+    const label = document.createElement('div');
+    label.className = 'label';
+    label.textContent = s.name;
+    card.append(img, label);
+    card.addEventListener('click', async () => {
+      liveSelectedSource = s;
+      window.api.selectSource(s.id);
+      document.querySelectorAll('#live-sources-grid .source-card').forEach((c) => c.classList.remove('selected'));
+      card.classList.add('selected');
+      updateLiveButton();
+      await startLivePreviewScreen();
+    });
+    grid.appendChild(card);
+  }
+}
+
+document.querySelectorAll('[data-live-kind]').forEach((tab) => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('[data-live-kind]').forEach((t) => t.classList.remove('active'));
+    tab.classList.add('active');
+    liveSourceKind = tab.dataset.liveKind;
+    renderLiveSources();
+  });
+});
+
+$('#refresh-live-sources').addEventListener('click', loadLiveSources);
+
+async function startLivePreviewScreen() {
+  if (livePreviewDisplay) { livePreviewDisplay.getTracks().forEach((t) => t.stop()); livePreviewDisplay = null; }
+  try {
+    livePreviewDisplay = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    $('#live-preview-video').srcObject = livePreviewDisplay;
+    $('#live-preview-empty').classList.add('hidden');
+    $('#live-cam-box').classList.remove('hidden');
+    positionCamBox();
+    livePreviewDisplay.getVideoTracks()[0].addEventListener('ended', () => {
+      if (liveActive) stopLive();
+      livePreviewDisplay = null;
+      $('#live-preview-video').srcObject = null;
+      $('#live-preview-empty').textContent = 'Pick a screen source above to preview placement';
+      $('#live-preview-empty').classList.remove('hidden');
+      $('#live-cam-box').classList.add('hidden');
+    });
+  } catch (err) {
+    $('#live-preview-empty').textContent = 'Preview unavailable: ' + err.message;
+    $('#live-preview-empty').classList.remove('hidden');
+  }
+  updateLiveButton();
+}
+
+async function startLiveCameraPreview() {
+  if (liveCamPreviewStream) { liveCamPreviewStream.getTracks().forEach((t) => t.stop()); liveCamPreviewStream = null; }
+  const devId = $('#live-camera-select').value;
+  if (!devId) { updateLiveButton(); return; }
+  try {
+    liveCamPreviewStream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: { exact: devId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
+    $('#live-cam-box-video').srcObject = liveCamPreviewStream;
+  } catch { /* camera unavailable — Go Live stays disabled */ }
+  updateLiveButton();
+}
+
+$('#live-camera-select').addEventListener('change', startLiveCameraPreview);
+
+// ---- Camera box drag/resize (positions expressed as fractions of the preview) ----
+function positionCamBox() {
+  const wrap = $('#live-preview-wrap');
+  const box = $('#live-cam-box');
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  const bw = Math.round(w * liveCamPos.wPct);
+  const bh = Math.round(bw * 9 / 16);
+  box.style.width = bw + 'px';
+  box.style.height = bh + 'px';
+  box.style.left = Math.round(liveCamPos.xPct * w) + 'px';
+  box.style.top = Math.round(liveCamPos.yPct * h) + 'px';
+}
+
+$('#live-cam-box').addEventListener('pointerdown', (e) => {
+  if (e.target === $('#live-cam-resize')) return;
+  const wrap = $('#live-preview-wrap');
+  dragState = { mode: 'move', startX: e.clientX, startY: e.clientY, startPos: { ...liveCamPos }, w: wrap.clientWidth, h: wrap.clientHeight };
+  e.preventDefault();
+});
+$('#live-cam-resize').addEventListener('pointerdown', (e) => {
+  const wrap = $('#live-preview-wrap');
+  dragState = { mode: 'resize', startX: e.clientX, startY: e.clientY, startPos: { ...liveCamPos }, w: wrap.clientWidth, h: wrap.clientHeight };
+  e.stopPropagation();
+  e.preventDefault();
+});
+window.addEventListener('pointermove', (e) => {
+  if (!dragState) return;
+  const dx = (e.clientX - dragState.startX) / dragState.w;
+  const dy = (e.clientY - dragState.startY) / dragState.h;
+  if (dragState.mode === 'move') {
+    liveCamPos.xPct = Math.min(1 - liveCamPos.wPct, Math.max(0, dragState.startPos.xPct + dx));
+    const bh = liveCamPos.wPct * (9 / 16);
+    liveCamPos.yPct = Math.min(1 - bh, Math.max(0, dragState.startPos.yPct + dy));
+  } else {
+    liveCamPos.wPct = Math.min(0.6, Math.max(0.1, dragState.startPos.wPct + dx));
+  }
+  positionCamBox();
+});
+window.addEventListener('pointerup', () => { dragState = null; });
+window.addEventListener('resize', () => { if (!$('#live-cam-box').classList.contains('hidden')) positionCamBox(); });
+
+// ---- Service tabs (Twitch / Custom RTMP) ----
+document.querySelectorAll('.mode-btn[data-service]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.mode-btn[data-service]').forEach((b) => b.classList.toggle('active', b === btn));
+    const svc = btn.dataset.service;
+    $('#service-twitch').classList.toggle('hidden', svc !== 'twitch');
+    $('#service-custom').classList.toggle('hidden', svc !== 'custom');
+    updateLiveButton();
+  });
+});
+
+$('#twitch-connect').addEventListener('click', () => {
+  window.api.openExternal('https://dashboard.twitch.tv/settings/stream');
+});
+
+$('#twitch-key').addEventListener('input', updateLiveButton);
+$('#custom-url').addEventListener('input', updateLiveButton);
+$('#custom-key').addEventListener('input', updateLiveButton);
+
+function activeService() {
+  return document.querySelector('.mode-btn[data-service].active')?.dataset.service || 'twitch';
+}
+
+function buildStreamTarget() {
+  if (activeService() === 'twitch') {
+    const key = $('#twitch-key').value.trim();
+    return key ? 'rtmp://live.twitch.tv/app/' + key : null;
+  }
+  const url = $('#custom-url').value.trim();
+  const key = $('#custom-key').value.trim();
+  if (!url) return null;
+  return url.replace(/\/+$/, '') + (key ? '/' + key : '');
+}
+
+function updateLiveButton() {
+  if (liveActive) { $('#live-btn').disabled = false; return; }
+  const ok = !!livePreviewDisplay && !!liveCamPreviewStream && !!buildStreamTarget();
+  $('#live-btn').disabled = !ok;
+}
+
+async function startLive() {
+  const target = buildStreamTarget();
+  if (!livePreviewDisplay) { toast('Pick a screen source first', true); return; }
+  if (!liveCamPreviewStream) { toast('Pick a camera first', true); return; }
+  if (!target) { toast('Enter your stream key / RTMP details first', true); return; }
+
+  let micStream = null, audioCtx = null;
+  const pos = { ...liveCamPos };
+
+  try {
+    const screenTrack = livePreviewDisplay.getVideoTracks()[0];
+    const camTrack = liveCamPreviewStream.getVideoTracks()[0];
+    const systemAudioStream = livePreviewDisplay.getAudioTracks().length
+      ? new MediaStream([livePreviewDisplay.getAudioTracks()[0]]) : null;
+
+    if ($('#live-mic-toggle').checked) {
+      const micId = $('#live-mic-select').value;
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { deviceId: micId ? { exact: micId } : undefined, echoCancellation: true, noiseSuppression: true }
+        });
+      } catch (err) {
+        toast('Mic unavailable, going live without it (' + err.message + ')', true);
+      }
+    }
+
+    const audio = buildAudioGraph(systemAudioStream, micStream);
+    audioCtx = audio.ctx;
+
+    const comp = await makeCompositeStream(screenTrack, camTrack, () => pos);
+    liveCleanup = [comp.cleanup];
+
+    await window.api.streamStart({ target });
+
+    const outStream = new MediaStream([comp.stream.getVideoTracks()[0]]);
+    const audioTrack = audio.makeTrack();
+    if (audioTrack) outStream.addTrack(audioTrack);
+
+    liveChunks = [];
+    liveRecorder = new MediaRecorder(outStream, { mimeType: pickMimeType(), videoBitsPerSecond: 6_000_000 });
+    liveRecorder.ondataavailable = async (e) => {
+      if (!e.data.size) return;
+      liveChunks.push(e.data);
+      try {
+        const buf = await e.data.arrayBuffer();
+        window.api.streamChunk(buf);
+      } catch { /* ignore a dropped chunk */ }
+    };
+    liveRecorder.start(500);
+
+    liveCtx = { micStream, audioCtx };
+    liveActive = true;
+    liveStartedAt = Date.now();
+    updateLiveUI(true);
+  } catch (err) {
+    toast('Could not go live: ' + err.message, true);
+    if (micStream) micStream.getTracks().forEach((t) => t.stop());
+    if (audioCtx) audioCtx.close().catch(() => {});
+    for (const c of liveCleanup) c();
+    liveCleanup = [];
+    try { await window.api.streamStop(); } catch {}
+  }
+}
+
+function stopLive() {
+  if (!liveActive) return;
+  liveActive = false;
+  if (liveRecorder && liveRecorder.state !== 'inactive') {
+    liveRecorder.onstop = finalizeLive;
+    liveRecorder.stop();
+  } else {
+    finalizeLive();
+  }
+}
+
+async function finalizeLive() {
+  await window.api.streamStop();
+
+  const ctx = liveCtx || {};
+  if (ctx.micStream) ctx.micStream.getTracks().forEach((t) => t.stop());
+  for (const c of liveCleanup) { try { c(); } catch {} }
+  liveCleanup = [];
+  if (ctx.audioCtx) ctx.audioCtx.close().catch(() => {});
+  liveCtx = null;
+  liveRecorder = null;
+
+  updateLiveUI(false);
+
+  const chunks = liveChunks;
+  liveChunks = [];
+  if (chunks.length) {
+    const blob = new Blob(chunks, { type: 'video/webm' });
+    try {
+      const buf = await blob.arrayBuffer();
+      const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+      const file = await window.api.saveRecording(buf, 'live', stamp);
+      toast('Stream ended. Saved: ' + file.split(/[\\/]/).pop());
+    } catch (err) {
+      toast('Stream ended, but saving the local copy failed: ' + err.message, true);
+    }
+  } else {
+    toast('Stream ended.');
+  }
+}
+
+function updateLiveUI(active) {
+  const btn = $('#live-btn');
+  btn.classList.toggle('recording', active);
+  $('#live-btn-label').textContent = active ? 'End stream' : 'Go live';
+  $('#live-timer').classList.toggle('hidden', !active);
+  clearInterval(liveTimerInterval);
+  if (active) {
+    liveTimerInterval = setInterval(() => {
+      $('#live-timer-text').textContent = fmtTime((Date.now() - liveStartedAt) / 1000);
+    }, 250);
+  }
+  updateLiveButton();
+}
+
+$('#live-btn').addEventListener('click', () => {
+  if (liveActive) stopLive(); else startLive();
+});
+
+window.api.onStreamStatus(({ type, message }) => {
+  if (type === 'error') {
+    toast('Stream error: ' + (message || 'connection failed'), true, 6000);
+    if (liveActive) stopLive();
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Library
 // ---------------------------------------------------------------------------
+let libItems = [];
+let libSort = 'date-desc';
+let libFilters = new Set(); // subset of 'captioned' | 'reel'
+
 async function renderLibrary() {
   const grid = $('#library-grid');
-  let items;
   try {
-    items = await window.api.listLibrary();
+    libItems = await window.api.listLibrary();
   } catch (err) {
     grid.innerHTML = '<div class="empty">Failed to read library: ' + err.message + '</div>';
     return;
   }
-  if (!items.length) {
+  if (!libItems.length) {
     grid.innerHTML = '<div class="empty">No recordings yet — make your first one!</div>';
     return;
   }
+
+  let items = libItems.slice();
+  if (libFilters.has('captioned')) items = items.filter((i) => i.captioned);
+  if (libFilters.has('reel')) items = items.filter((i) => i.isReel);
+
+  items.sort((a, b) => {
+    if (libSort === 'date-asc') return a.mtime - b.mtime;
+    if (libSort === 'name') return a.name.localeCompare(b.name);
+    if (libSort === 'size') return b.size - a.size;
+    return b.mtime - a.mtime; // date-desc
+  });
+
+  if (!items.length) {
+    grid.innerHTML = '<div class="empty">No recordings match this filter.</div>';
+    return;
+  }
+
   grid.innerHTML = '';
   for (const item of items) {
     const card = document.createElement('div');
@@ -563,7 +935,20 @@ async function renderLibrary() {
     const badge = document.createElement('span');
     badge.className = 'lib-badge';
     badge.textContent = item.ext;
-    meta.append(badge, fmtSize(item.size), new Date(item.mtime).toLocaleString());
+    meta.append(badge);
+    if (item.captioned) {
+      const cb = document.createElement('span');
+      cb.className = 'lib-badge captioned';
+      cb.textContent = 'CC';
+      meta.append(cb);
+    }
+    if (item.isReel) {
+      const rb = document.createElement('span');
+      rb.className = 'lib-badge reel';
+      rb.textContent = 'Reel';
+      meta.append(rb);
+    }
+    meta.append(fmtSize(item.size), new Date(item.mtime).toLocaleString());
     info.append(name, meta);
     card.append(thumb, info);
     card.addEventListener('click', () => openModal(item));
@@ -571,25 +956,58 @@ async function renderLibrary() {
   }
 }
 
+$('#lib-sort').addEventListener('change', () => { libSort = $('#lib-sort').value; renderLibrary(); });
+document.querySelectorAll('.chip[data-filter]').forEach((chip) => {
+  chip.addEventListener('click', () => {
+    const f = chip.dataset.filter;
+    if (libFilters.has(f)) libFilters.delete(f); else libFilters.add(f);
+    chip.classList.toggle('active', libFilters.has(f));
+    renderLibrary();
+  });
+});
+
 $('#open-folder').addEventListener('click', () => window.api.openFolder());
 
 // ---------------------------------------------------------------------------
 // Modal: player + trim + export
 // ---------------------------------------------------------------------------
+let currentPair = null;
+let buildingShort = false;
+let capturingCaptions = false;
+let makingReels = false;
+
 async function openModal(item) {
   currentItem = item;
-  $('#modal-title').textContent = item.name;
+  currentPair = null;
+  const dotIdx = item.name.lastIndexOf('.');
+  $('#modal-title-input').value = dotIdx > -1 ? item.name.slice(0, dotIdx) : item.name;
+  $('#modal-ext').textContent = '.' + item.ext;
   const player = $('#player');
   player.src = item.url;
   $('#trim-start').value = 0;
   $('#trim-end').value = '';
   $('#trim-meta').textContent = '';
   $('#export-progress').classList.add('hidden');
+  $('#short-block').classList.add('hidden');
+  $('#short-progress').classList.add('hidden');
+  $('#captions-progress').classList.add('hidden');
+  $('#captions-replace').checked = false;
+  $('#reels-progress').classList.add('hidden');
   $('#modal').classList.remove('hidden');
 
   const canExport = item.ext !== 'gif';
   $('#export-mp4').disabled = !canExport || exporting;
   $('#export-gif').disabled = !canExport || exporting;
+
+  const canTranscribe = item.ext !== 'gif';
+  $('#captions-block').classList.toggle('hidden', !canTranscribe);
+  $('#add-captions').disabled = !canTranscribe || capturingCaptions;
+  $('#reels-block').classList.toggle('hidden', !canTranscribe);
+  $('#make-reels').disabled = !canTranscribe || makingReels;
+  $('#captions-preview').classList.toggle('hidden', !canTranscribe);
+  captionsPos = { ...CAPTION_PRESETS.bottom };
+  document.querySelectorAll('.chip[data-caption-preset]').forEach((c) => c.classList.toggle('active', c.dataset.captionPreset === 'bottom'));
+  if (canTranscribe) updateCaptionsPreview();
 
   // WebM from MediaRecorder often reports Infinity duration; ask ffmpeg.
   let dur = null;
@@ -598,6 +1016,19 @@ async function openModal(item) {
     $('#trim-end').value = dur.toFixed(1);
     $('#trim-meta').textContent = 'Duration: ' + dur.toFixed(1) + 's';
   }
+
+  if (item.ext === 'webm') {
+    try { currentPair = await window.api.findPair(item.path); } catch { currentPair = null; }
+  }
+  const hasPair = !!currentPair;
+  $('#short-block').classList.toggle('hidden', !canExport);
+  $('#build-short').disabled = !canExport || buildingShort;
+  $('#short-combine').checked = hasPair;
+  $('#short-combine').disabled = !hasPair;
+  $('#short-combine-hint').textContent = hasPair
+    ? '(screen + camera pair found)'
+    : '(no paired recording — will crop just this video to 9:16)';
+  $('#short-cam-top-row').classList.toggle('hidden', !(hasPair && $('#short-combine').checked));
 }
 
 function closeModal() {
@@ -614,15 +1045,39 @@ $('#modal').addEventListener('click', (e) => { if (e.target === $('#modal')) clo
 
 $('#reveal-file').addEventListener('click', () => currentItem && window.api.reveal(currentItem.path));
 
-$('#delete-file').addEventListener('click', async () => {
+$('#rename-file').addEventListener('click', async () => {
   if (!currentItem) return;
+  const newBase = $('#modal-title-input').value.trim();
+  if (!newBase) { toast('Enter a name', true); return; }
   try {
-    await window.api.deleteRecording(currentItem.path);
-    toast('Deleted ' + currentItem.name);
+    const newPath = await window.api.renameRecording(currentItem.path, newBase);
+    toast('Renamed to ' + newPath.split(/[\\/]/).pop());
     closeModal();
     renderLibrary();
   } catch (err) {
-    toast('Delete failed: ' + err.message, true);
+    toast('Rename failed: ' + err.message, true);
+  }
+});
+$('#modal-title-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') $('#rename-file').click();
+});
+
+$('#delete-file').addEventListener('click', async () => {
+  if (!currentItem) return;
+  const target = currentItem;
+  // Release the player's hold on the file before asking the OS to delete it —
+  // otherwise an actively-open <video> can transiently lock it on Windows.
+  const player = $('#player');
+  player.pause();
+  player.removeAttribute('src');
+  player.load();
+  try {
+    await window.api.deleteRecording(target.path);
+    toast('Deleted ' + target.name);
+    closeModal();
+    renderLibrary();
+  } catch (err) {
+    toast('Delete failed: ' + err.message, true, 6000);
   }
 });
 
@@ -671,10 +1126,224 @@ window.api.onExportProgress(({ percent }) => {
 $('#export-mp4').addEventListener('click', () => runExport('mp4'));
 $('#export-gif').addEventListener('click', () => runExport('gif'));
 
+$('#short-combine').addEventListener('change', () => {
+  $('#short-cam-top-row').classList.toggle('hidden', !($('#short-combine').checked && currentPair));
+});
+
+$('#build-short').addEventListener('click', async () => {
+  if (!currentItem || buildingShort) return;
+  const combine = $('#short-combine').checked && !!currentPair;
+  buildingShort = true;
+  const progWrap = $('#short-progress');
+  const fill = $('#short-progress-fill');
+  const label = $('#short-progress-label');
+  progWrap.classList.remove('hidden');
+  fill.style.width = '0%';
+  label.textContent = 'Building… 0%';
+  $('#build-short').disabled = true;
+
+  try {
+    const res = await window.api.buildShort(combine ? {
+      combine: true,
+      screenPath: currentPair.screenPath,
+      cameraPath: currentPair.cameraPath,
+      cameraOnTop: $('#short-cam-top').checked
+    } : {
+      combine: false,
+      input: currentItem.path
+    });
+    fill.style.width = '100%';
+    label.textContent = 'Done → ' + res.output.split(/[\\/]/).pop() + ' (' + fmtSize(res.size) + ')';
+    toast('Short built');
+    renderLibrary();
+  } catch (err) {
+    label.textContent = 'Build failed';
+    toast('Build Short failed: ' + err.message, true, 6000);
+  } finally {
+    buildingShort = false;
+    $('#build-short').disabled = false;
+  }
+});
+
+window.api.onShortsProgress(({ percent }) => {
+  if (!buildingShort) return;
+  $('#short-progress-fill').style.width = percent + '%';
+  $('#short-progress-label').textContent = 'Building… ' + percent + '%';
+});
+
+// ---------------------------------------------------------------------------
+// Captions (local transcription + burn-in)
+// ---------------------------------------------------------------------------
+function describeProgress(p) {
+  if (!p) return '';
+  if (p.phase === 'decoding-audio') return 'Decoding audio…';
+  if (p.phase === 'downloading-model') return `Downloading speech model (${p.file || ''} ${p.percent || 0}%)…`;
+  if (p.phase === 'transcribing') return 'Transcribing…';
+  if (p.phase === 'scoring') return 'Scoring moments…';
+  if (p.phase === 'burning') return `Burning captions… ${p.percent || 0}%`;
+  if (p.phase === 'cutting') return `Cutting clip ${p.index || 1}/${p.total || 1}… ${p.percent || 0}%`;
+  if (p.phase === 'done') return 'Done';
+  return p.phase || '';
+}
+
+// Rough CSS approximation of the ffmpeg/libass output — not pixel-perfect,
+// but enough to see roughly where captions will land before burning them in.
+const CAPTION_PREVIEW_SAMPLE = { line: 'This is a sample caption line', word: 'WORD' };
+const CAPTION_PRESETS = { top: { xPct: 0.5, yPct: 0.12 }, middle: { xPct: 0.5, yPct: 0.5 }, bottom: { xPct: 0.5, yPct: 0.88 } };
+
+let captionsPos = { ...CAPTION_PRESETS.bottom }; // fractions of the player, drag-updated
+let captionsDrag = null;
+
+function updateCaptionsPreview() {
+  const preview = $('#captions-preview');
+  if (preview.classList.contains('hidden')) return;
+
+  const style = $('#captions-style').value;
+  const mode = $('#captions-mode').value;
+  const size = parseInt($('#captions-size').value, 10);
+  $('#captions-size-label').textContent = size + 'px';
+
+  preview.className = 'captions-preview style-' + style + (captionsDrag ? ' dragging' : '');
+  const text = CAPTION_PREVIEW_SAMPLE[mode] || CAPTION_PREVIEW_SAMPLE.line;
+  preview.innerHTML = style === 'black-box' ? `<span>${text}</span>` : text;
+
+  preview.style.left = (captionsPos.xPct * 100) + '%';
+  preview.style.top = (captionsPos.yPct * 100) + '%';
+
+  const player = $('#player');
+  const videoH = player.videoHeight || 720;
+  const renderedH = player.clientHeight || 360;
+  const scaled = size * (renderedH / videoH);
+  preview.style.fontSize = Math.max(10, Math.round(scaled)) + 'px';
+}
+
+['captions-style', 'captions-mode', 'captions-size'].forEach((id) => {
+  $('#' + id).addEventListener('input', updateCaptionsPreview);
+});
+$('#player').addEventListener('loadedmetadata', updateCaptionsPreview);
+
+document.querySelectorAll('.chip[data-caption-preset]').forEach((chip) => {
+  chip.addEventListener('click', () => {
+    document.querySelectorAll('.chip[data-caption-preset]').forEach((c) => c.classList.remove('active'));
+    chip.classList.add('active');
+    captionsPos = { ...CAPTION_PRESETS[chip.dataset.captionPreset] };
+    updateCaptionsPreview();
+  });
+});
+
+$('#captions-preview').addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  document.querySelectorAll('.chip[data-caption-preset]').forEach((c) => c.classList.remove('active'));
+  const wrap = $('#player-wrap');
+  captionsDrag = { startX: e.clientX, startY: e.clientY, startPos: { ...captionsPos }, w: wrap.clientWidth, h: wrap.clientHeight };
+  updateCaptionsPreview();
+});
+window.addEventListener('pointermove', (e) => {
+  if (!captionsDrag) return;
+  const dx = (e.clientX - captionsDrag.startX) / captionsDrag.w;
+  const dy = (e.clientY - captionsDrag.startY) / captionsDrag.h;
+  captionsPos.xPct = Math.min(0.97, Math.max(0.03, captionsDrag.startPos.xPct + dx));
+  captionsPos.yPct = Math.min(0.97, Math.max(0.03, captionsDrag.startPos.yPct + dy));
+  updateCaptionsPreview();
+});
+window.addEventListener('pointerup', () => {
+  if (!captionsDrag) return;
+  captionsDrag = null;
+  updateCaptionsPreview();
+});
+
+$('#add-captions').addEventListener('click', async () => {
+  if (!currentItem || capturingCaptions) return;
+  capturingCaptions = true;
+  const progWrap = $('#captions-progress');
+  const fill = $('#captions-progress-fill');
+  const label = $('#captions-progress-label');
+  progWrap.classList.remove('hidden');
+  fill.style.width = '2%';
+  label.textContent = 'Starting…';
+  $('#add-captions').disabled = true;
+
+  try {
+    const res = await window.api.burnCaptions({
+      input: currentItem.path,
+      replace: $('#captions-replace').checked,
+      style: $('#captions-style').value,
+      mode: $('#captions-mode').value,
+      xPct: captionsPos.xPct,
+      yPct: captionsPos.yPct,
+      fontSize: parseInt($('#captions-size').value, 10)
+    });
+    fill.style.width = '100%';
+    label.textContent = 'Done → ' + res.output.split(/[\\/]/).pop() + ' (' + fmtSize(res.size) + ')';
+    toast('Captions added');
+    renderLibrary();
+  } catch (err) {
+    label.textContent = 'Captioning failed';
+    toast('Add Captions failed: ' + err.message, true, 6000);
+  } finally {
+    capturingCaptions = false;
+    $('#add-captions').disabled = false;
+  }
+});
+
+window.api.onCaptionsProgress((p) => {
+  if (!capturingCaptions) return;
+  const fill = $('#captions-progress-fill');
+  const label = $('#captions-progress-label');
+  if (typeof p.percent === 'number') fill.style.width = p.percent + '%';
+  label.textContent = describeProgress(p);
+});
+
+// ---------------------------------------------------------------------------
+// Make Reels (local heuristic viral-clip generator)
+// ---------------------------------------------------------------------------
+$('#make-reels').addEventListener('click', async () => {
+  if (!currentItem || makingReels) return;
+  makingReels = true;
+  const progWrap = $('#reels-progress');
+  const fill = $('#reels-progress-fill');
+  const label = $('#reels-progress-label');
+  progWrap.classList.remove('hidden');
+  fill.style.width = '2%';
+  label.textContent = 'Starting…';
+  $('#make-reels').disabled = true;
+
+  try {
+    const res = await window.api.makeReels({
+      input: currentItem.path,
+      maxLength: parseInt($('#reel-length').value, 10)
+    });
+    const n = res.clips.length;
+    const capped = res.consideredCandidates > res.cappedAt;
+    const msg = n
+      ? `Made ${n} reel${n === 1 ? '' : 's'}` + (capped ? ` (capped at ${res.cappedAt} — more candidates were found)` : '')
+      : 'No standout moments found';
+    fill.style.width = '100%';
+    label.textContent = msg;
+    toast(msg, !n, capped ? 6000 : 3200);
+    renderLibrary();
+  } catch (err) {
+    label.textContent = 'Reel generation failed';
+    toast('Make Reels failed: ' + err.message, true, 6000);
+  } finally {
+    makingReels = false;
+    $('#make-reels').disabled = false;
+  }
+});
+
+window.api.onReelsProgress((p) => {
+  if (!makingReels) return;
+  const fill = $('#reels-progress-fill');
+  const label = $('#reels-progress-label');
+  if (typeof p.percent === 'number') fill.style.width = p.percent + '%';
+  label.textContent = describeProgress(p);
+});
+
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 loadSources();
-loadDevices().then(() => { updateRecordButton(); updateHint(); });
+loadDevices().then(() => { updateRecordButton(); updateHint(); startLiveCameraPreview(); });
 loadOutputDir();
 renderLibrary();
+loadLiveSources();

@@ -9,16 +9,18 @@
 // standalone `rcedit` npm package (no winCodeSign involved), then repackage
 // just the NSIS installer from the now-patched unpacked build.
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execSync } = require('child_process');
 const { rcedit } = require('rcedit');
 
 const root = path.join(__dirname, '..');
 const exe = path.join(root, 'dist', 'win-unpacked', 'BloomRecorder.exe');
 const icon = path.join(root, 'build', 'icon.ico');
 
+// npx resolves to a .cmd shim on Windows, which needs shell:true to execute
+// at all — all args here are hardcoded constants (no external/user input),
+// so building the command string ourselves is safe.
 function run(cmd, args) {
-  const bin = process.platform === 'win32' ? `${cmd}.cmd` : cmd;
-  execFileSync(bin, args, { stdio: 'inherit', cwd: root });
+  execSync([cmd, ...args].join(' '), { stdio: 'inherit', cwd: root });
 }
 
 (async () => {

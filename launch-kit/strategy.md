@@ -1,4 +1,4 @@
-# Launch Strategy — Screen Recorder
+# Launch Strategy — Bloom Recorder
 
 ## Positioning
 "Pay once. Own it forever. No subscription." — the local-first Loom replacement for people who record tutorials, bug reports, and course content and just want the file. Loom charges monthly for videos that live on their servers; we charge $29 once for videos that live on yours.

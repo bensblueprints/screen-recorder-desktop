@@ -1096,6 +1096,11 @@ window.addEventListener('mouseup', () => {
 
 $('#open-folder').addEventListener('click', () => window.api.openFolder());
 
+$('#suite-ad-link').addEventListener('click', (e) => {
+  e.preventDefault();
+  window.api.openExternal('https://onetimesuite.com');
+});
+
 // ---------------------------------------------------------------------------
 // Modal: player + trim + export
 // ---------------------------------------------------------------------------

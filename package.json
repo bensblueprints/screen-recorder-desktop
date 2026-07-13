@@ -9,13 +9,14 @@
   "scripts": {
     "start": "electron .",
     "test": "node test/smoke.js",
-    "dist": "electron-builder --win nsis",
-    "dist:win": "electron-builder --win nsis",
+    "dist": "node scripts/build-win.js",
+    "dist:win": "node scripts/build-win.js",
     "dist:mac": "electron-builder --mac dmg"
   },
   "devDependencies": {
     "electron": "^33.2.0",
-    "electron-builder": "^25.1.8"
+    "electron-builder": "^25.1.8",
+    "rcedit": "^5.0.2"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",

@@ -12,17 +12,32 @@
 
 ## ✨ Features
 
+**Recording**
 - **Screen · Camera · Both** — record your screen, your webcam, or both at once
 - **Split or picture-in-picture** — with both selected, save two separate files (each with audio) or one combined video with the camera overlaid
 - **Source picker with live previews** — record any screen or individual window, thumbnails included
 - **Device selection** — choose exactly which camera and which microphone to record
 - **System + mic audio** — mixed cleanly, and carried into *every* output file
 - **Choose your output folder** — save recordings wherever you want; the choice sticks
-- **Floating recording pill** — tiny always-on-top timer with a stop button, so your main window stays out of the shot
+- **Floating recording pill** — tiny always-on-top timer with pause/resume and stop, so your main window stays out of the shot
+- **Go Live** — stream your screen + camera straight to Twitch or any custom RTMP endpoint while it records a local copy at the same time
+
+**Library**
 - **Local library** — every recording auto-saves to `Videos/BloomRecorder` with generated thumbnails, plays right in the app
+- **Sort & filter** — by date/name/size, or filter to just captioned/reel clips
+- **Rename, delete, multi-select** — click or drag-select across the grid, batch-delete in one go
 - **MP4 export** — H.264 + faststart, plays everywhere, with live progress
 - **Optimized GIF export** — proper two-pass palette generation (palettegen/paletteuse), not the muddy single-pass junk
 - **Trim** — set start/end seconds before exporting, no separate editor needed
+- **Build Short (9:16)** — reframe any recording (or a paired screen+camera split) to vertical for Reels/Shorts/TikTok, with a "show full screen" letterbox toggle so you don't lose the edges of a screen capture to a crop
+
+**Local AI editing — all fully offline, no cloud, no API keys**
+- **Captions** — transcribes locally (quantized Whisper via ONNX), burns in captions with 4 style templates, line-by-line or word-by-word timing, an adjustable size slider, and literal drag-to-position placement on the video preview
+- **Make Reels** — local heuristic scans the transcript for hook-word density, emphasis, pauses, and pace to find and cut standout vertical clips automatically (not a real virality predictor — a practical local heuristic)
+- **Remove Silences** — detects quiet gaps (`ffmpeg silencedetect`), lets you review/trim/undo each one before a single-pass cut
+- **Edit Transcript** — the Descript move: transcribe, then delete words or pauses directly from the text to cut the video, with shift-click ranges and full undo
+
+**And**
 - **100% local** — zero telemetry, zero network calls, zero accounts
 
 ## 🚀 Quick start
@@ -71,7 +86,8 @@ Loom is great for team clouds. If you just want to *record your screen and own t
 - **Electron** — main + preload + renderer, context isolation on
 - **desktopCapturer + getDisplayMedia** — native screen/window capture with a custom picker
 - **MediaRecorder (VP9/Opus)** — in-renderer recording, mic mixed via Web Audio `AudioContext`
-- **ffmpeg-static** — bundled ffmpeg for MP4 (libx264), two-pass GIF, trims, thumbnails, and duration probing
+- **ffmpeg-static** — bundled ffmpeg for MP4 (libx264), two-pass GIF, trims, thumbnails, duration/resolution probing, silence detection, and caption/subtitle burn-in (real `.ass` documents, not `force_style` — see commit history if you're curious why)
+- **@huggingface/transformers (ONNX runtime, Node)** — quantized Whisper running fully locally in the main process for captions, Make Reels, and the Transcript Editor; no API keys, no network calls
 - Plain HTML/CSS/JS renderer — no framework, boots instantly
 
 ## 📁 Where recordings go

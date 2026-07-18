@@ -1,5 +1,10 @@
 # 🌸 BloomRecorder
 
+## Demo
+
+https://github.com/user-attachments/assets/0074a4fc-f106-46e7-9486-d3e0c7be41e4
+
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue.svg)]()
 [![Local First](https://img.shields.io/badge/100%25-local-red.svg)]()

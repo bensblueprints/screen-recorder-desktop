@@ -2,7 +2,11 @@
 
 ## Demo
 
-https://github.com/user-attachments/assets/0074a4fc-f106-46e7-9486-d3e0c7be41e4
+
+
+https://github.com/user-attachments/assets/1996a66e-af28-40b7-b29e-d3d26c58c002
+
+
 
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
